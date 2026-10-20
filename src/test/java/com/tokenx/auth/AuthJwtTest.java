@@ -137,6 +137,19 @@ class AuthJwtTest extends AbstractIntegrationTest {
   }
 
   @Test
+  void shouldReturn404ForUnknownApiPathWhenAuthenticated() throws Exception {
+    String token =
+        JwtTestFactory.token(
+            "1", "someone", "USER", Instant.now(), Instant.now().plusSeconds(600));
+
+    // The catch-all exception handler must not turn a routing miss into a 500.
+    mockMvc
+        .perform(get("/api/v1/unknown-resource").header("Authorization", "Bearer " + token))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.code").value("NOT_FOUND"));
+  }
+
+  @Test
   void shouldNotTrustAUserIdSentByTheClient() throws Exception {
     String username = TestAccounts.uniqueUsername("spoof");
     createdUsernames.add(username);
