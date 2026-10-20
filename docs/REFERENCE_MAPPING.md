@@ -22,6 +22,7 @@
 | `src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java` | `@PostConstruct` 启动单线程 `ExecutorService` 从 Redis Stream（`stream.orders`，组 `g1`/`c1`）阻塞读取并落单；`@Resource @Lazy` 自注入拿代理；Redisson `RLock` | 异步落单要区分「请求受理」与「订单创建成功」 | 本项目**不在 V1 使用 Redis Stream**；V1.5 用 Kafka + Transactional Outbox，并与同步基线对比后再定（F8/F9） |
 | `src/main/java/com/hmdp/interceptor/`（`LoginInterceptor`、`RefreshTokenInterceptor`）+ `utils/UserHolder` | 双拦截器 + `ThreadLocal` 保存当前用户 | 「用户身份来自服务端上下文，不信任客户端 userId」 | F1 改用 **Spring Security + JWT**，身份从 `SecurityContext` 取得；不迁移 `ThreadLocal` 自管理 |
 | `src/main/java/com/hmdp/dto/Result.java` | 统一返回包装 `Result{success,errorMsg,data}` | 统一响应/错误结构 | V1 使用 `code`/`message`/`requestId` + 恰当 HTTP 状态码（F1 建立统一异常处理，见 `PROJECT_SPEC.md` §7） |
+| `hmdp.sql`（11 张表） | `tb_voucher.type` 区分普通券/秒杀券；`tb_seckill_voucher` 以 `voucher_id` 为主键 1:1 扩展库存与时间窗；`tb_voucher_order` 只有 `voucher_id`，**无二级索引、无 `unique(voucher,user)`、无金额快照、无超时字段** | 「普通购买与秒杀可以共用一张订单表」这一结论；同时看清**不能**照搬的约束缺失 | F0-3 决策见 `docs/DATABASE_DESIGN.md` §14：共用 `purchase_order`，但必须补 `UNIQUE(activity_id,user_id)`、`request_id` 唯一键、价格/额度快照、`expires_at`、`user_id` 索引 |
 
 ## 明确不采纳的旧做法
 
