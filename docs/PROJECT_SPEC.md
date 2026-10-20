@@ -1,6 +1,6 @@
 # TokenX — 项目需求与技术设计（V1 设计基线）
 
-**状态**：设计文档；不是已经实现的功能清单。\
+**状态**：已决设计基线；不是已经实现的功能清单。数据库细节以 `DATABASE_DESIGN.md` 为准，高并发演进以 `HIGH_CONCURRENCY_DESIGN.md` 为准。\
 **定位**：Java 21 + Spring Boot 4 重构 AI Token 套餐限时交易平台；以黑马点评的秒杀实现思想为基线，逐步建立能演示和验证的交易闭环。\
 **主要目标**：做出完整、正确、可测试的后端系统；在有同步性能基线后，再进行 Redis/Kafka 优化。\
 **原则**：单体优先、交易正确性优先、需求驱动技术、先跑通再优化。
@@ -17,13 +17,14 @@
 6. Token 钱包：支付完成后入账、查询余额和账本流水；同一订单绝不重复入账。
 7. 基础前端：登录、套餐/秒杀页面、订单页、钱包页、基础管理员页面。
 8. 文档与测试：接口契约、运行说明、单元/集成测试和业务正确性验证。
+9. 普通购买：与秒杀使用不同接口和 Service，但共用订单、支付、关单与钱包模型。
 
 ### 1.2 V1 稳定后再做（V1.5）
 
-- Redis 热点套餐缓存（以真实查询路径为依据），Redis Lua 抢购准入。
-- Kafka 异步订单链路、Transactional Outbox、幂等消费、补偿及对账。
+- Redis 热点读取缓存与 Lua 抢购准入；Redis 是快路径，MySQL 是最终库存与资格权威。
+- Kafka 作为唯一异步下单队列；Transactional Outbox 只用于数据库事务后的下游事件。**不使用 Redis Stream 作为第二条订单队列。**
 - 简单限流、指标采集、压测和同步/异步方案对比。
-- 只有确有需求时才做 Redis Stream；不要因为黑马点评有 Stream 就与 Kafka 叠加两条主消息链路。
+- Redis Stream 只作为黑马点评参考实现的研究对象，不进入 TokenX 订单链路。
 
 ### 1.3 非 V1 目标（明确禁止提前开发）
 
@@ -39,7 +40,7 @@
 | Web | Spring MVC（Boot 4 的 WebMVC Starter） | 不因为流式调用预先切换 WebFlux |
 | ORM | MyBatis-Plus `mybatis-plus-spring-boot4-starter` **3.5.17** | MyBatis 相关依赖避免重复引入；复杂库存 SQL 使用显式 SQL |
 | 数据库 | MySQL **9.7.x LTS** | 当前本机为 9.7.2；MySQL JDBC Driver 随 BOM 管理 |
-| 数据库迁移 | Flyway（候选，须先做兼容验证） | Flyway 官方已验证 MySQL 版本未明确覆盖 9.7，先做迁移 Smoke Test；失败则记录阻塞并报用户选择，不悄悄替换版本/关闭校验 |
+| 数据库迁移 | Flyway **12.4.0** | F0-2 已在本机 MySQL 9.7.2 完成首次迁移和幂等重跑；后续每个业务迁移仍需真实集成测试 |
 | Redis | **8.10.x**，Spring Data Redis/Lettuce | 本地 127.0.0.1，无密码；后续部署要求独立 ACL/认证 |
 | Kafka Broker | **4.3.1** KRaft | V1.5 接入；Spring Kafka 与 kafka-clients 交由 Boot BOM 管理，不要求客户端同 Broker 小版本 |
 | 认证 | Spring Security + JWT | Token 生命周期从简单可靠开始；无第三方 OAuth V1 |
@@ -51,7 +52,7 @@
 
 **不预装**：Spring Cloud、Nacos、Seata、Sentinel、Redisson、Elasticsearch、ShardingSphere、RabbitMQ、Canal、Kubernetes、Quartz。出现明确需求后需有简要技术决策记录（ADR）和用户确认。
 
-**版本核验门禁**：初建工程先验证 Java21+Boot4.1.1+MyBatisPlus3.5.17 对 MySQL9.7、Redis8.10 的真实连接，再验证 Flyway；在相关模块开始前验证 Kafka4.3 客户端连接。版本不兼容只能形成 issue/ADR，不能自行强制覆盖 BOM 依赖。
+**版本核验门禁**：F0-2 已验证 Java21+Boot4.1.1+MyBatisPlus3.5.17 对 MySQL9.7、Redis8.10 的真实连接及 Flyway 12.4.0 迁移；F8 开始前仍须验证 BOM 管理的 Kafka Client 与 Broker 4.3.1 的真实连接。版本不兼容只能形成 issue/ADR，不能自行强制覆盖 BOM 依赖。
 
 ## 3. 模块职责（单体，按业务分包）
 
@@ -85,11 +86,14 @@
 
 ### 业务规则（V1 固定，变更需讨论）
 
-- 每个用户每场秒杀活动**最多成功获得一次抢购资格**；已抢/取消后默认不可重抢，直到需求改变。
+- 每个用户每场秒杀活动**最多获得一次抢购资格**；订单关闭或超时后也不可重抢，由数据库唯一键兜底。
 - 商品套餐与活动是不同对象：活动可指向一个套餐，活动价格和库存是活动快照，不随着套餐变更回溯改变历史订单。
 - 金额全部用整数最小货币单位（示例：分），Token 额度全部用整数单位，禁止 double/float 表达余额和价格。
 - 一次下单对应一个活动和一个套餐；不支持购物车、组合优惠。
-- 订单超时由服务端时间决定；一开始使用明确约定的单时区与 UTC 存储规范，日期序列化为 ISO8601。
+- 秒杀活动必须有结束时间，时间窗为 `[start_at,end_at)`；长期常规售卖走普通购买，不用空结束时间模拟。
+- 待支付订单默认 15 分钟超时，时长配置化，订单创建时把最终截止时间快照到 `expires_at`。
+- 订单超时由服务端时间决定；数据库统一以 `DATETIME(3)` 存 UTC，HTTP 日期序列化为 ISO8601。
+- 用户名大小写不敏感；`Alice` 与 `alice` 是同一账号。`app_user.status` 保留，V1 登录时拒绝禁用用户；热请求不逐次查用户表，已签发 JWT 最迟在过期时失效。
 - V1 模拟支付仅供本地演示，不允许宣传为生产级支付平台。
 - 抢购成功和支付成功是两个不同结果，文案与 API 必须区分。
 
@@ -101,9 +105,9 @@
 
 ### 5.2 库存语义
 
-活动库存分为 `available_stock`（可再预占）与 `reserved_stock`（待支付订单占用），必要时保留 `sold_stock`（已支付）。
+活动库存只持久化 `available_stock`（可再预占）与 `reserved_stock`（待支付订单占用）；已售量由 `total_stock - available_stock - reserved_stock` 计算，不落 `sold_stock`。
 
-不变量示例：`available_stock >= 0`，`reserved_stock >= 0`，`sold_stock >= 0`，`available + reserved + sold = total_stock`。库存状态更新和订单变动必须在同一数据库事务中完成，且利用条件 UPDATE。
+不变量：`available_stock >= 0`，`reserved_stock >= 0`，`available_stock + reserved_stock <= total_stock`；对应的已支付秒杀订单数必须等于 `total_stock - available_stock - reserved_stock`。库存状态更新和订单变动必须在同一数据库事务中完成，且利用条件 UPDATE。
 
 ### 5.3 钱包语义
 
@@ -116,19 +120,17 @@
 
 | 表（建议名） | 最重要字段 / 唯一性 | 创建阶段 |
 |---|---|---|
-| `users` | `id`, `username` UNIQUE, `password_hash`, `role`, `status` | 用户与登录 |
-| `token_product` | `id`, `name`, `token_amount`, `list_price_cent`, `status` | 套餐管理 |
-| `seckill_activity` | `id`, `product_id`, `start_at`, `end_at`, `sale_price_cent`, `status`, `version` | 活动管理 |
-| `activity_inventory` | `activity_id` PK, `total_stock`, `available_stock`, `reserved_stock`, `sold_stock` | 同步秒杀 |
-| `orders` | `id`, `order_no` UNIQUE, `activity_id`, `user_id`, `status`, `amount_cent`, `token_amount`, `expire_at`, `request_id` UNIQUE | 同步秒杀 |
-| `purchase_qualification` | `(activity_id,user_id)` UNIQUE, `order_id`, `status` | 同步秒杀（若订单 UNIQUE 已足够，可简化而不重复建表） |
-| `payment_record` | `id`, `order_id`, `payment_ref` UNIQUE, `state`, `paid_at` | 模拟支付 |
-| `token_account` | `user_id` PK, `available_balance`, `updated_at` | 钱包 |
-| `token_ledger` | `id`, `user_id`, `biz_type`, `biz_id`, `action`, `amount`; UNIQUE `(biz_type,biz_id,action)` | 钱包 |
-| `outbox_event` | `id`, `aggregate_id`, `event_type`, `payload`, `publish_status`, `created_at` | V1.5 |
-| `processed_message` | PK `(consumer_name,event_id)` | V1.5 |
+| `app_user` | `id`, `username` UNIQUE（大小写不敏感）, `password_hash`, `role`, `status` | 用户与登录 |
+| `token_package` | `id`, `name`, `credit_amount`, `list_price_cent`, `status` | 套餐管理 |
+| `seckill_activity` | `id`, `package_id`, `start_at`, `end_at` NOT NULL, `activity_price_cent`, `credit_amount_snapshot`, `status` | 活动管理 |
+| `activity_inventory` | `activity_id` PK, `total_stock`, `available_stock`, `reserved_stock`；已售量由前三者计算 | 同步秒杀 |
+| `purchase_order` | 内部 `id`, 对外 `order_no` UNIQUE, `(user_id,request_id)` UNIQUE, `(activity_id,user_id)` UNIQUE，价格/额度快照与 `expires_at` | 同步秒杀与普通购买 |
+| `token_account` | `user_id` PK, `available_balance`, `updated_at`；与用户同事务创建 | 用户与登录（F1 建表，F5 开放钱包能力） |
+| `token_ledger` | `id`, `user_id`, `biz_type`, `biz_id`, `effect_type`, `delta`; UNIQUE `(biz_type,biz_id,effect_type)` | 钱包 |
+| `outbox_event` / `processed_message` | 事务后事件可靠发布与消费幂等 | F8（V1.5） |
+| `seckill_request` | 异步准入的最终结果、`request_id` 与 `order_id` | F9（V1.5） |
 
-只有确实有不同职责时才拆 `purchase_qualification`；不要同时制造三个表示相同限购事实的表。SQL 类型、索引在具体 Feature 开发时根据查询/更新链路确定；所有 schema 改动必须有迁移版本与测试。
+V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由订单唯一键表达，后者没有外部支付事实可记录。`token_account` 在 F1 与 `app_user` 一同引入并由同一注册事务创建，避免 F5 回填竞态和支付时懒创建。SQL 类型、索引与迁移顺序见 `DATABASE_DESIGN.md`。
 
 ## 7. REST API 初稿（不要一次实现全部）
 
@@ -145,17 +147,20 @@
 | POST | `/admin/activities` | 创建秒杀活动 | F3 |
 | GET | `/activities/{id}` | 活动详情、状态和库存展示 | F3 |
 | POST | `/activities/{id}/orders` | 下单；Header `Idempotency-Key` | F4 |
-| GET | `/orders/{id}` | 查询自己的订单 | F4 |
-| POST | `/orders/{id}/mock-pay` | 模拟支付 | F5 |
+| GET | `/orders/{orderNo}` | 按不可枚举对外单号查询自己的订单 | F4 |
+| POST | `/orders` | 普通购买；Header `Idempotency-Key` | F4.5 |
+| POST | `/orders/{orderNo}/mock-pay` | 模拟支付 | F5 |
 | GET | `/wallet` | 查询余额 | F5 |
 | GET | `/wallet/ledger` | 流水分页 | F5 |
+| POST | `/activities/{id}/order-requests` | V1.5 异步秒杀受理，成功返回 202 | F9 |
+| GET | `/order-requests/{requestId}` | 查询异步请求最终结果 | F9 |
 
 认证：`Authorization: Bearer <JWT>`；用户身份从认证上下文取，不允许从请求体传 `userId` 来决定交易归属。活动时间、库存、价格等由服务端决定。
 
 ### 状态码约定
 
 - 200：读或幂等重试返回已有结果。
-- 201：同步下单并创建订单成功；当 V1.5 真正异步受理时可改用 202 + 查询凭证（**需进行接口版本/契约评审**）。
+- 201：同步下单并创建订单成功；F9 的独立异步入口返回 202 + `requestId`，不改变 V1 同步接口语义。
 - 400：非法参数；401：未登录；403：无权限；404：资源不存在；409：重复资格/状态冲突；429：限流；500：预期外故障。
 - 同一 `Idempotency-Key` 携带不同参数必须拒绝，不允许静默复用。
 
@@ -171,19 +176,19 @@ Kafka (:9092) 本地已安装，但在 V1.5 前不参与核心链路
 
 开发环境约束：本机 MySQL root 有密码（业务应用应使用本地专用账号）；Redis 当前无密码，只能监听回环地址；Kafka 开发默认本机连接。密码只来自用户本地环境变量或未提交的 `application-local.yml`，绝不放到 Git。
 
-## 9. 运行时拓扑（V1.5 备选设计，非立即实现）
+## 9. 运行时拓扑（V1.5 已决目标，按计划分阶段实现）
 
 ```text
-Client → API → Redis Lua 资格/库存准入
-                   ↓
-       MySQL 持久化购买资格 + Outbox（同一事务）
-                   ↓
-             Kafka 异步落单
-                   ↓
-             订单状态机 / 钱包
+Client → API → Redis Lua 原子准入 → Kafka command topic → Order Worker
+                                                        ↓
+                                               MySQL 订单/库存事实
+                                                        ↓
+                          MySQL Outbox → Kafka event topic → 独立下游
 ```
 
-技术说明：如果采用“Redis 预扣 + DB 写入”，跨 Redis/DB 的原子性问题必须明确；不能用 Kafka Exactly Once 冒充数据库恰好一次。真正改造前要求先有同步基线的正确性和压测数据，再提交 ADR 比较同步、Outbox、Redis Stream 等方案。**任何一条链路都不能仅凭 Redis 返回扣减成功就宣告订单创建成功。**
+技术说明：Redis 准入、Kafka 写入和 MySQL 落单不存在跨系统原子事务；系统以 `requestId`、数据库唯一键、至少一次消费、补偿和对账收敛。只有 Kafka Broker 确认后才返回“已受理”，只有 MySQL 提交后才返回“已成单”。Redis Stream 不进入本项目订单主链路。完整故障矩阵、背压与指标见 `HIGH_CONCURRENCY_DESIGN.md`。
+
+V1.5 用配置 `tokenx.seckill.mode=SYNC|ASYNC` 选择唯一秒杀写入口；同一运行环境不得同时开放同步建单和异步受理，防止绕过 Redis 准入。依赖故障不会自动切换模式。
 
 ## 10. 基础非功能要求
 
@@ -191,7 +196,8 @@ Client → API → Redis Lua 资格/库存准入
 - 安全性：权限检查、密码哈希、JWT 验证、校验入参、脱敏日志、不信任客户端价格与 userId。
 - 可维护性：业务包结构稳定、DTO 和实体隔离、唯一异常映射、数据库约束与代码一致。
 - 测试：业务规则单测、MySQL 真实集成测试、接口切片测试、最小前端流程测试；压测仅在 V1 功能闭环后做。
-- 可观测性：接口 requestId、错误日志、基础健康检查；不在初期引入完整链路追踪堆栈。
+- 性能与韧性：所有线程池、连接池、Producer 缓冲和队列有界；超载明确返回 429/503；入口 QPS、订单 TPS 与排队延迟分开报告。
+- 可观测性：接口 requestId、错误日志、基础健康检查；V1.5 增加 Redis Lua 结果、Kafka lag/最老消息年龄、DB 锁等待与业务对账指标，不在初期引入完整链路追踪堆栈。
 - 兼容性：Mac 开发、JDK21、Spring Boot4；Node26 + pnpm12；禁用 `latest` 漂移版本。
 
 ## 11. 非目标与避免过度设计
@@ -205,4 +211,4 @@ Client → API → Redis Lua 资格/库存准入
 
 ## 12. 项目完成定义（V1）
 
-本地可以从零初始化环境，完成：注册登录 → 创建套餐 → 创建活动 → 秒杀下单 → 订单查询 → 模拟支付 → 钱包入账和流水 → 重复支付/超时关闭/超卖测试。启动与测试步骤可复现。此后才能进入性能优化阶段。
+本地可以从零初始化环境，完成：注册登录 → 创建套餐 → 创建活动 → 秒杀或普通购买 → 订单查询 → 模拟支付 → 钱包入账和流水 → 重复支付/超时关闭/超卖测试。启动与测试步骤可复现。此后才能进入 Redis/Kafka 性能优化阶段；V1.5 的高并发完成定义见 `HIGH_CONCURRENCY_DESIGN.md` §2 和 §7。

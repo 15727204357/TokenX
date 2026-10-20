@@ -54,9 +54,11 @@
 
 ## 6. Redis 与 Kafka 规范（在各自阶段生效）
 
-**Redis：** Key 使用命名空间 `tokenx:模块:场景:标识`；设置合理 TTL；不随便使用 `KEYS *` 清理全库；Lua 需要测试并发和异常路径；Redis 只是快路径，不能单独宣称防超卖最终正确性。
+**Redis：** Key 使用命名空间 `tokenx:模块:场景:标识`；同一活动的 Lua key 使用 `{activityId}` hash tag；设置合理 TTL；不随便使用 `KEYS *` 清理全库；Lua 必须 O(1) 并测试并发、补偿、重启和 key 丢失路径。Redis 只是缓存和准入快路径，不能单独宣称防超卖最终正确性。Redis 故障时只能在有界并发下回退 MySQL，禁止无保护的 fail-open。
 
-**Kafka：** 选定 Topic 后明确 Key、事件 Schema、消费者组、重试、幂等、Offset 提交时机。DB 与 Kafka 双写须说明故障窗口；采用 Outbox 时 outbox 记录与业务写入同一 MySQL 事务。消息至少一次消费，重复业务效果由 DB 唯一约束/状态转移阻止。V1.5 之前不在主链路引入 Kafka。
+**Kafka：** 订单异步化时 Kafka 是唯一消息主链路，禁止再用 Redis Stream 建第二条订单队列。选定 Topic 后明确 Key、版本化 Schema、消费者组、有限重试、DLT、幂等与 Offset 提交时机。Producer 使用 `acks=all` 和幂等发送；Consumer 在 MySQL 事务提交后提交 Offset，按至少一次消费设计。DB 与 Kafka 双写须说明故障窗口；采用 Outbox 时 outbox 记录与业务写入同一 MySQL 事务。重复业务效果由 DB 唯一约束/状态转移阻止，不能用 Kafka Exactly Once 代替数据库幂等。V1.5 之前不在主链路引入 Kafka。
+
+**背压：** HTTP 工作线程、数据库连接池、Kafka Producer 缓冲和 Consumer 并发必须有界且有超时。容量不足时返回明确的 `429/503`，禁止用无限队列掩盖过载。入口 QPS、准入 QPS、订单 TPS 和端到端延迟按 `HIGH_CONCURRENCY_DESIGN.md` 分开测量。
 
 ## 7. 测试策略：务实的 TDD + 测试金字塔
 
@@ -87,6 +89,7 @@
 - 建议 `shouldRejectDuplicatePurchaseForSameActivity` 等具有可读性的行为命名。
 - 可用 `given/when/then` 结构，但不强行引入 BDD 框架。
 - 测试时间使用可控 Clock（如果功能依赖当前时间）；并发测试断言最终库存、订单、余额，不只断言 HTTP 200。
+- 性能测试必须固定到达率并报告业务拒绝与系统错误；每轮结束执行库存、资格、订单和账本对账，不能只看吞吐图。
 
 ## 8. 必须做 / 可做 / 不该做的设计模式
 

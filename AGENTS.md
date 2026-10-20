@@ -5,7 +5,7 @@
 
 ## 0. 每次任务开始时必须做
 
-1. 读取 `AGENTS.md`、`docs/PROJECT_SPEC.md`、`docs/ENGINEERING_STANDARDS.md`、`docs/DEVELOPMENT_PLAN.md`、`docs/GIT_WORKFLOW.md`。
+1. 读取 `AGENTS.md`、`docs/PROJECT_SPEC.md`、`docs/ENGINEERING_STANDARDS.md`、`docs/DEVELOPMENT_PLAN.md`、`docs/GIT_WORKFLOW.md`；涉及数据模型或性能链路时还必须读取 `docs/DATABASE_DESIGN.md`、`docs/HIGH_CONCURRENCY_DESIGN.md`。
 2. 查看现有项目结构、最近变更和测试；**先阅读现有代码，再决定改哪里**。
 3. 对照 `docs/DEVELOPMENT_PLAN.md`，锁定**唯一当前任务**；若任务未明确，先选首个未完成任务并说明选择依据，不擅自开始下一项。
 4. 先给出简短实施计划：目标、涉及文件、验收标准、测试、风险。然后只实现该项。
@@ -76,6 +76,8 @@
 - `docs/PROJECT_SPEC.md` — 业务、技术栈、接口、数据模型与总体边界。
 - `docs/ENGINEERING_STANDARDS.md` — 编码、测试、设计模式与代码审查要求。
 - `docs/DEVELOPMENT_PLAN.md` — 唯一合法的功能实施顺序与验收门槛。
+- `docs/DATABASE_DESIGN.md` — 已决的数据模型、事务、索引与迁移基线。
+- `docs/HIGH_CONCURRENCY_DESIGN.md` — Redis/Kafka 唯一高并发演进路线、故障恢复与性能口径。
 - `docs/GIT_WORKFLOW.md` — Git 初始化、功能分支、提交、审查和危险操作禁止清单。
 - `docs/REFERENCES.md` — 黑马点评、TokenMarket、Spring 官方资料。
 - `QODER_START_PROMPT.md` — 初次交给 Qoder 的任务提示。

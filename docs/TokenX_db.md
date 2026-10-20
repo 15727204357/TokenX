@@ -1,6 +1,9 @@
-# TokenX：面向高并发秒杀与可复现压测的数据库设计 V3
+# TokenX 数据库设计 V3（历史输入稿，已归档）
 
-> 状态：F0-3 设计评审稿（2026-10-20）；**非已实现或实测结果**。本文件以业务真实性、可测量的吞吐能力、交易正确性为约束，而不是复制任何开源仓库的表。
+> **禁止据此实施。** 本文件是 F0-3 的原始评审输入，为保留决策来历而归档，其中 Redis Stream、字段和索引等候选内容已被后续评审否决或修订。
+> 当前唯一规范来源：产品/API 看 `PROJECT_SPEC.md`，数据库看 `DATABASE_DESIGN.md`，高并发链路看 `HIGH_CONCURRENCY_DESIGN.md`，实施顺序看 `DEVELOPMENT_PLAN.md`。
+>
+> 原状态：F0-3 设计评审稿（2026-10-20）；非已实现或实测结果。
 >
 > 适用技术栈：Java 21、Spring Boot 4.x、MySQL 9.7（InnoDB）、Redis 8.x、Kafka 4.x。具体 Maven 依赖版本由项目锁定。
 >

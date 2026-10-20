@@ -1,8 +1,8 @@
-# TokenX 数据库设计（F0-3 评审稿）
+# TokenX 数据库设计（F0-3 已决基线）
 
-> **状态**：设计评审稿，**不是已实现、未压测**的结构。文中所有吞吐数字均为容量推算或目标值，**未做实测**，统一标注「推算/待验证」。
+> **状态**：设计决策已收敛，**不是已实现、未压测**的结构。文中所有吞吐数字均为容量推算或目标值，**未做实测**，统一标注「推算/待验证」。
 > **输入材料**：`docs/TokenX_db.md`（V3 设计稿，用户提供）、`docs/PROJECT_SPEC.md` §5/§6/§7、`docs/ENGINEERING_STANDARDS.md` §5、黑马点评源码实读记录（见 `docs/REFERENCE_MAPPING.md`）。
-> **本文地位**：本文是**决策版本**；`docs/TokenX_db.md` 保留为评审输入原稿。两者冲突时以本文「§10 冲突与推荐」的决议为准。
+> **本文地位**：本文是数据库决策版本；`PROJECT_SPEC.md` 是产品/API 基线，`HIGH_CONCURRENCY_DESIGN.md` 是运行时并发基线，三者已经同步。`docs/TokenX_db.md` 仅保留为归档输入，不再参与实施。
 > **本轮不做**：不建表、不写迁移 SQL、不写 Mapper/Service、不改业务代码。
 
 ---
@@ -17,10 +17,10 @@
 | 4 | 库存已售量 `sold_stock` | **不落库**，由 `total - available - reserved` 计算 |
 | 5 | 秒杀限购 | 靠 `UNIQUE(activity_id, user_id)`，**不建** `purchase_qualification` |
 | 6 | 模拟支付流水 | **不建** `payment_record`；真实网关接入时另建 `payment_transaction` |
-| 7 | 订单对外编号 | **保留 `order_no`**（SPEC 要求），PK 仍是紧凑自增 `id` |
+| 7 | 订单对外编号 | **使用不可枚举 `order_no`**，所有外部 API 不暴露自增 `id`；PK 仍是紧凑自增 `id` |
 | 8 | 用户角色 | V3 稿缺 `role`，**必须补上**，否则管理员接口无法鉴权 |
 | 9 | 分库分表 / 库存分桶 / 订单分区 | **全部不做**，触发条件见 §9 |
-| 10 | 异步链路 | V1 不引入；Redis 只做准入过滤，Kafka 只在 V1.5 有独立下游时才进（§8） |
+| 10 | 异步链路 | V1 不引入；V1.5 使用 Redis Lua 准入 + Kafka 唯一订单队列 + MySQL Worker，**不使用 Redis Stream**（§7/§8） |
 | 11 | 普通购买与秒杀 | **接口分、Service 分、表不分**：两个下单入口 + 两个 Service，共用 `purchase_order`；不手写单例、不提前上策略模式（§15） |
 
 ---
@@ -47,7 +47,7 @@
 | I1 | 库存不为负、不超卖 | `UNSIGNED` + 条件 UPDATE（`WHERE available_stock > 0`）+ 检查影响行数 |
 | I2 | `available + reserved + paid = total` | 三量同事务更新；`CHECK (available + reserved <= total)` 兜底 |
 | I3 | 一人一活动最多一单 | `UNIQUE(activity_id, user_id)` |
-| I4 | 同一请求重试不产生第二单 | `UNIQUE(request_id)` |
+| I4 | 同一用户同一请求重试不产生第二单 | `UNIQUE(user_id, request_id)` |
 | I5 | 订单状态单向迁移 | 条件 UPDATE `WHERE status = 0`，检查影响行数为 1 |
 | I6 | 同一订单只入账一次 | `UNIQUE(biz_type, biz_id, effect_type)` |
 | I7 | 余额不为负 | `BIGINT UNSIGNED` + 条件更新 |
@@ -112,9 +112,9 @@ PAID / CLOSED 为终态，V1 无退款，不可回退。
 | 指标 | 目标 | 验证方式 |
 |---|---|---|
 | 正确性 | S1 下有效订单数 ≤ 库存；无超卖；一人一单 | 压测后跑 §6.4 对账 SQL，结果必须为空 |
-| 入口 QPS | A 阶段不作承诺；B 阶段目标 ≥ 5,000（待验证） | k6 固定到达率 |
-| 订单 TPS | A 阶段单活动 ≥ 500（待验证） | MySQL `Com_insert` / 应用计数器 |
-| 尾延迟 | 下单接口 P99 ≤ 300 ms（A 阶段，待验证） | k6 `http_req_duration` |
+| 入口 QPS | A 阶段只记录基线；V1.5 目标 ≥ A 的 5 倍且初始靶点 ≥ 5,000（待验证） | k6 固定到达率 |
+| 订单 TPS | A 阶段只记录可复现基线；V1.5 必须同时报告成单 TPS，不能用入口 QPS 替代 | MySQL `Com_insert` / 应用计数器 |
+| 尾延迟 | A 阶段记录 P50/P95/P99；V1.5 受理 P99 靶点 ≤ 100 ms、成单 P99 ≤ 3 s（待验证） | k6 + 请求终态时间 |
 | 错误率 | < 0.1%（除业务拒绝外） | k6 失败率 |
 | 死锁 | S4 下 0 致命失败（允许重试成功） | `SHOW ENGINE INNODB STATUS` |
 
@@ -168,7 +168,7 @@ erDiagram
     PURCHASE_ORDER {
         bigint id PK
         char order_no UK
-        char request_id UK
+        binary request_id UK
         bigint user_id FK
         bigint activity_id FK
         tinyint status
@@ -224,7 +224,8 @@ erDiagram
 
 - `PRIMARY KEY (id)`
 - `UNIQUE KEY uk_user_username (username)`
-- 用户名大小写：`utf8mb4_0900_ai_ci` 下 `Alice` 与 `alice` 视为同一用户（防冒名）。**这是产品决策**，见 §12 问题 Q4。
+- 用户名大小写：`utf8mb4_0900_ai_ci` 下 `Alice` 与 `alice` 视为同一用户（防冒名），已由 Q4 定案。
+- `status=DISABLED` 时拒绝新登录；JWT 热路径不逐请求回表，已签发 Token 最迟在其配置化过期时间失效。若未来要求即时封禁，再独立设计短 Token + 撤销缓存，不能把每请求查用户表塞入秒杀热路径。
 
 **查询与索引**
 
@@ -329,7 +330,7 @@ erDiagram
 |---|---|---|---|---|
 | `id` | `BIGINT UNSIGNED` | NO | AUTO_INCREMENT | 紧凑聚簇主键，插入顺序即时间顺序 |
 | `order_no` | `CHAR(26)` ascii_bin | NO | — | 对外单号（不可枚举），`UNIQUE` |
-| `request_id` | `CHAR(36)` ascii_bin | NO | — | 客户端 `Idempotency-Key`，`UNIQUE` |
+| `request_id` | `BINARY(16)` | NO | — | 规范 UUID `Idempotency-Key` 的紧凑存储；与 `user_id` 联合唯一 |
 | `user_id` | `BIGINT UNSIGNED` | NO | — | 下单人，来自认证上下文 |
 | `package_id` | `BIGINT UNSIGNED` | NO | — | 来源套餐（统计/追溯） |
 | `activity_id` | `BIGINT UNSIGNED` | **YES** | NULL | 秒杀有值；普通购买为 NULL |
@@ -350,10 +351,12 @@ erDiagram
 |---|---|---|---|
 | `PRIMARY KEY (id)` | 聚簇 | 点查、时间序 | — |
 | `UNIQUE uk_order_no (order_no)` | 二级唯一 | 对外单号不可枚举 | 每次插入多 1 次索引写 |
-| `UNIQUE uk_request_id (request_id)` | 二级唯一 | 重试幂等 | 36 字节键，插入多 1 次索引写 |
+| `UNIQUE uk_user_request (user_id, request_id)` | 二级唯一 | 幂等键按认证用户作用域隔离 | 24 字节逻辑键，插入多 1 次索引写 |
 | `UNIQUE uk_activity_user (activity_id, user_id)` | 二级唯一 | **一人一活动一单**（最终防线） | 插入多 1 次索引写；NULL 不参与唯一（普通订单可多笔） |
 | `KEY idx_order_user (user_id)` | 普通 | 我的订单列表 | 插入多 1 次索引写 |
 | `KEY idx_order_timeout (status, expires_at)` | 普通 | 超时扫描 | 插入多 1 次索引写 |
+
+同时使用 `CHECK` 限制 `order_type/status` 枚举，并保证 `SECKILL` 必须有 `activity_id`、`NORMAL` 必须没有 `activity_id`；`paid_at/closed_at` 与终态时间的完整组合由迁移集成测试验证。MySQL `CHECK` 是最后防线，Service 的显式状态机仍是主要错误语义来源。
 
 **索引为什么这样写**
 
@@ -361,9 +364,11 @@ erDiagram
 - `idx_order_timeout (status, expires_at)`：扫描条件就是 `status=0 AND expires_at < now`，前缀等值 + 范围，正好顺着索引读。
 - 不再加 `(activity_id,status)`、`(user_id,status)`、`(package_id)`、`(pay_amount_cent)`：没有对应查询，纯属给写入加税。
 
-**写入成本必须正视**：一个订单插入 = 1 次聚簇插入 + **5 次二级索引插入**。这是本表最大开销。若实测 S2 阶段插入成为瓶颈，按此顺序减压：① 去掉 `order_no`（改用 `id` 对外，代价是可枚举）→ 4 个索引；② `request_id` 改 `BINARY(16)` → 键更短；③ 才考虑分区（§9）。
+**写入成本必须正视**：一个订单插入 = 1 次聚簇插入 + **5 次二级索引插入**。这是本表最大开销。`order_no` 和幂等唯一键已经是稳定契约，不能在优化时偷偷删除。若实测 S2 插入成为瓶颈，先用 `EXPLAIN ANALYZE` 和查询指标移除真正无用的读取索引、调整批量/提交参数与存储配置，再按 §9 的量化触发条件评审归档或分片。
 
-**`order_no` 生成**：应用侧生成 26 位 `Crockford Base32`（时间有序 + 随机尾），不带业务含义、不可枚举。**不引入数据库序列表**（会变成新的全局热点）。
+**`order_no` 生成**：应用侧生成 26 位 Crockford Base32（时间有序 + 至少 80 位随机尾），不带业务含义、不能由相邻值推算；所有 HTTP 路径只接受 `order_no`，自增 `id` 仅供内部关联。**不引入数据库序列表**（会变成新的全局热点）。
+
+**幂等契约**：API 只接受规范 UUID 格式 `Idempotency-Key`，应用转换为 `BINARY(16)`；命中既有 `(user_id,request_id)` 时比较订单类型与目标套餐/活动，相同参数返回既有结果，不同参数返回 `409 IDEMPOTENCY_KEY_REUSED`。
 
 **外键**：`user_id`/`package_id`/`activity_id` **不建物理外键**。理由：订单是写入最热的表，物理外键会在父行上加共享锁并带来额外检查；改用"服务端校验 + 集成测试 + 对账 SQL"。父表低频写，但首版统一不建外键（一致性用应用层与对账保证），避免热路径不确定性。
 
@@ -377,7 +382,7 @@ erDiagram
 
 | 字段 | 类型 | NULL | 默认 | 说明 |
 |---|---|---|---|---|
-| `user_id` | `BIGINT UNSIGNED` | NO | — | 主键，注册时创建 |
+| `user_id` | `BIGINT UNSIGNED` | NO | — | 主键；F1 与用户同事务创建 |
 | `available_balance` | `BIGINT UNSIGNED` | NO | 0 | 当前可用额度 |
 | `updated_at` | `DATETIME(3)` | NO | ON UPDATE | |
 
@@ -426,10 +431,12 @@ erDiagram
 
 ```text
 @Transactional
-1) INSERT INTO purchase_order(..., status=0)           ← 先落"未支付"行？见下方顺序说明
-2) UPDATE activity_inventory SET available_stock-1, reserved_stock+1
+1) 按 (user_id,request_id) 查询既有订单；同参直接返回，异参返回 409
+2) SELECT 活动快照 WHERE status=PUBLISHED AND now∈[start_at,end_at) FOR SHARE
+3) UPDATE activity_inventory SET available_stock-1, reserved_stock+1
    WHERE activity_id=? AND available_stock>0
-3) 若 2) 影响行数=0 → 抛"已售罄"，事务回滚
+4) 若 3) 影响行数=0 → 抛"已售罄"，事务回滚
+5) INSERT INTO purchase_order(..., status=0, expires_at=now+配置时长)
 ```
 
 **顺序取舍（必须先扣库存还是先插订单）**
@@ -451,16 +458,23 @@ INSERT INTO purchase_order
 VALUES (?,?,?,?,?,1,?,?,?,0,?);
 ```
 
-**事务边界**：以上两条 + `COMMIT` 是一个事务，持锁时间目标 < 1 ms（待验证）。
+**事务边界**：活动读取、库存更新、订单插入与 `COMMIT` 是一个事务；从取得库存行锁到提交的持锁时间目标 < 1 ms（待验证）。
 **拒绝路径**：`available_stock>0` 不成立 → 影响行数 0 → 立即抛业务异常，**不开启后续写**。
+
+`expires_at` 默认使用配置化 15 分钟，在建单时固化；之后修改配置只影响新订单。事务中只使用注入的服务端 `Clock` 所得同一时刻，客户端时间不参与判断。
 
 ### 5.2 模拟支付（4 次写，同一事务）
 
 ```sql
--- 1. 订单状态单向迁移，拿订单行锁
+-- 0. 按对外单号和当前用户读取内部 id、订单类型与可信快照；查不到统一返回 404
+SELECT id, order_type, activity_id, credit_amount, status
+  FROM purchase_order
+ WHERE order_no = ? AND user_id = ?;
+
+-- 1. 订单状态单向迁移，拿订单行锁；再次带 user_id 防止调用层遗漏归属校验
 UPDATE purchase_order
    SET status = 1, paid_at = ?, updated_at = ?
- WHERE id = ? AND status = 0;
+ WHERE id = ? AND user_id = ? AND status = 0;
 -- 影响行数 0 → 已支付或已关闭，直接按现状返回（幂等）
 
 -- 2. 活动订单结转库存（普通订单跳过）
@@ -496,9 +510,9 @@ UPDATE activity_inventory
  WHERE activity_id = ? AND reserved_stock > 0;
 ```
 
-**扫描**：`SELECT id FROM purchase_order WHERE status=0 AND expires_at <= ? ORDER BY expires_at LIMIT 100` → 逐条开短事务。禁止一把大事务批量关单（长时间持锁 + 长 undo）。多实例部署时靠 `status=0` 条件更新天然互斥，重复执行只会有一个成功。
+**扫描**：每个 Worker 用短事务执行 `SELECT id FROM purchase_order WHERE status=0 AND expires_at <= ? ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`，随后在同一事务关闭该订单；循环次数与 Worker 数均有界。这样多实例不会重复领取同一行，也不会用一把大事务持有上百笔订单锁。普通订单关闭时只改订单，秒杀订单才释放预留库存。
 
-### 5.4 注册（2 次写）
+### 5.4 注册（F1 起固定为 2 次写）
 
 ```sql
 INSERT INTO app_user(username, password_hash, role, status) VALUES (?,?,0,0);
@@ -507,18 +521,21 @@ INSERT INTO token_account(user_id, available_balance) VALUES (?, 0);
 
 同一事务：不允许出现"有用户没账户"的中间态。
 
-### 5.5 锁顺序（防死锁的唯一规则）
+### 5.5 锁顺序（按“新建”与“既有订单”分开）
 
-所有涉及多表的写事务，**统一按此顺序取锁**：
+不能用一条口号覆盖两类事务：秒杀建单必须先抢稀缺库存，而支付/关单操作的是已经存在的订单。无环规则如下：
 
 ```text
-purchase_order → activity_inventory → token_account → token_ledger(插入)
+新建秒杀订单：seckill_activity(FOR SHARE) → activity_inventory → INSERT 新 purchase_order
+既有订单状态：purchase_order → activity_inventory(秒杀才有) → token_account → INSERT token_ledger
+普通购买建单：token_package(FOR SHARE) → INSERT 新 purchase_order
 ```
 
-- 支付与关单都从订单行开始，同一订单只会有一个赢家，另一个排队后条件更新失败 → 天然互斥。
-- 跨用户支付共享同一活动库存行，但都排在订单行之后，不构成环。
-- **禁止**任何路径先改库存再改订单（会与上述顺序相反，制造环）。
-- 状态判定的 SQL 不允许 `SELECT ... FOR UPDATE` 后再 `UPDATE`（多一次往返）；一律单条条件 UPDATE。
+- 新订单行在插入提交前不可能被支付/关单事务锁住，因此“库存 → 插入新订单”不会与“既有订单 → 库存”形成等待环。
+- 支付与关单都先用订单条件更新取得既有订单行锁，同一订单只有一个赢家；禁止先修改库存再回头修改**既有**订单。
+- 活动/套餐发布后关键快照不可修改；`FOR SHARE` 只与极低频管理写冲突，活动之间互不影响。
+- 状态判定不先 `SELECT ... FOR UPDATE` 再更新；支付/关单用单条条件 UPDATE。超时 Worker 为领取任务使用 `FOR UPDATE SKIP LOCKED` 是明确例外。
+- 捕获 MySQL 死锁时只能重试整个短事务，次数有上限并带抖动，同时记录指标；不能从中间 SQL 继续。
 
 ### 5.6 事务内禁止清单
 
@@ -597,44 +614,44 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 
 **这是唯一能证明"正确性"的基线**。没有它，后面所有优化都无法判断是否退化。
 
-### 7.2 阶段 B：Redis 准入过滤 + MySQL 同步落单
+### 7.2 阶段 B：Redis Lua 准入保护 + MySQL 同步落单
 
 | 视角 | 分析 |
 |---|---|
-| 请求链路 | HTTP → Redis Lua（查活动缓存/库存预判/是否已参与/限流）→ 通过者走 A 的事务 |
+| 请求链路 | HTTP → Redis Lua（活动 gate quota + 用户/请求幂等 + 限流）→ 通过者走 A 的事务 |
 | DB 写入次数 | **成功订单仍然是 A 的 1 UPDATE + 1 INSERT**；被 Redis 挡掉的请求 **0 次 DB 写** |
 | 事务边界 | 不变（Redis 不是事务参与者，也不是库存权威） |
-| 一致性风险 | Redis 与 MySQL 会短暂不一致（Redis 认为有货、MySQL 已扣完，或反之）。必须允许"Redis 放行但 MySQL 售罄"这种**正常失败**；Redis **绝不能**作为"下单成功"的依据 |
+| 一致性风险 | Redis 与 MySQL 会短暂不一致。MySQL 失败时用 `requestId` 比对的补偿 Lua 归还 quota；Redis **绝不能**作为"下单成功"依据。Redis key 丢失时暂停活动并重建，不能直接装载 `total_stock` |
 | 理论瓶颈 | 瓶颈从 DB 转移到 Redis 单 key 的原子操作（同一活动一个 key），以及 Lua 执行时长 |
 | 何时验证 | 同一 S1 场景下与 A 对比：入口 QPS 提升多少、MySQL 写次数下降多少、P99 是否改善 |
 | 是否改表 | **不需要**。表结构不变，只是把无效流量挡在 DB 之外 |
 
 **关键认知**：B 提升的是**入口吞吐**与**数据库保护**，不提升有效订单 TPS 上限——真正落单仍要抢同一行库存锁。
 
-### 7.3 阶段 C：Redis Lua + Stream 异步削峰
+### 7.3 阶段 C：Redis Lua + Kafka 异步削峰
 
 | 视角 | 分析 |
 |---|---|
-| 请求链路 | HTTP → Lua 原子预扣（Redis 内库存 + 已参与集合）→ `XADD` → 立即返回 `QUEUED + requestId`；Worker 消费 → MySQL 条件更新 + 建单 → ACK |
-| DB 写入次数 | 请求路径 **0 次**；每个被受理请求由 Worker 完成 1 UPDATE + 1 INSERT（+ 可选 `seckill_request` 1 INSERT + 1 UPDATE） |
-| 事务边界 | 变成"Redis 预扣"与"MySQL 落单"两段，中间是**可丢失窗口**。必须承认：Redis Stream + AOF 不等于零丢失 |
-| 一致性风险 | 重复消费（需 `request_id` 唯一键兜底）、消息丢失（需补偿扫描 + 对账）、Redis 与 DB 库存漂移（需定期校准） |
-| 理论瓶颈 | Redis 单分片吞吐、Stream 消费速率、Worker 落库速率 |
+| 请求链路 | HTTP → Lua 原子准入并标记 `RESERVED` → Kafka Producer 等待 Broker ACK → 标记 `QUEUED` → 返回 `202 + requestId`；Worker 消费 → MySQL 条件更新 + 建单 → DB 提交后提交 offset |
+| DB 写入次数 | 请求路径 **0 次**；每个被受理请求由 Worker 在一个事务完成库存 UPDATE、订单 INSERT 与 `seckill_request` 终态 INSERT/UPDATE |
+| 事务边界 | Redis、Kafka、MySQL 三段之间没有原子事务；只有 Broker ACK 后才承诺“已受理”，只有 MySQL 提交后才是“已成单” |
+| 一致性风险 | Producer 超时结果不确定、至少一次重复消费、Redis 与 DB quota 漂移；用请求幂等、DB 唯一键、条件更新、租约补偿和对账收敛 |
+| 理论瓶颈 | Redis 单 key Lua、Kafka 单活动分区、Worker 落库速率与 MySQL 库存行 |
 | 何时验证 | 压测必须报**两个延迟**：受理 P99、排队到订单确认 P99；并测"杀掉 Worker 后重启"是否丢单/重复 |
-| 是否改表 | 见 §8.2：**不一定**。但若要"跨重启查询排队状态"就必须加 `seckill_request` |
+| 是否改表 | F9 **必须**增加 `seckill_request` 保存最终请求结果；排队快状态在 Redis |
 
-**结论**：C 是"用一致性复杂度换入口吞吐"。只有在 A/B 实测证明"入口 QPS 或用户下单时延不达标"时才做，且必须先写 ADR（`docs/DEVELOPMENT_PLAN.md` F9 要求）。
+**结论**：C 是本项目 V1.5 的已决高并发目标，不是 V1 的前置条件。它用显式的最终一致性、补偿和可观测性换入口吞吐；完整契约与故障矩阵见 `HIGH_CONCURRENCY_DESIGN.md`。
 
 ### 7.4 三阶段对照
 
-| 维度 | A 同步 | B Redis 过滤 | C Lua + Stream |
+| 维度 | A 同步 | B Redis + 同步 MySQL | C Redis + Kafka |
 |---|---|---|---|
 | 入口能力 | 低（每请求都进 DB） | 高 | 最高 |
 | 有效订单 TPS | 受库存行锁限制 | 同 A | 受 Worker 落库限制 |
-| DB 写入/成功单 | 2 写 | 2 写 | 2 写（+可选 2 写） |
+| DB 写入/成功单 | 2 写 | 2 写 | 2 个业务写 + 1 个请求终态写 |
 | DB 写入/失败请求 | 1 写 | 0 | 0 |
-| 一致性模型 | 强（单库事务） | 强（Redis 仅加速） | 最终一致（需补偿） |
-| 新增表 | 无 | 无 | 可选 `seckill_request` |
+| 一致性模型 | 强（单库事务） | 最终事实强一致（Redis 仅准入） | 最终一致（需补偿、幂等、对账） |
+| 新增表 | 无 | 无 | 必须 `seckill_request` |
 | 实现成本 | 最低 | 中（Lua + 缓存失效） | 高（幂等、补偿、可观测） |
 
 ---
@@ -645,26 +662,27 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 
 只新增 Redis key 与缓存逻辑：活动信息缓存、库存预判、用户参与集合、限流计数。**不新增表**。
 
-### 8.2 C 阶段：`seckill_request` 是否必要
+### 8.2 C 阶段：`seckill_request`（必须）
 
-**判定标准**：用户是否需要"查我这次抢购到底怎么样了"——即受理与落单分离后，请求本身成为需要持久化的业务对象。
-
-若需要（推荐，只要做 C）：
+异步受理与订单落库分离后，请求本身成为可查询对象。Redis 保存 `RESERVED/QUEUED` 快状态，Kafka Consumer 在 MySQL 保存最终结果：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | `BIGINT UNSIGNED` PK AI | |
-| `request_id` | `CHAR(36)` ascii_bin | `UNIQUE`，与订单的幂等键一致 |
+| `request_id` | `BINARY(16)` | 与 `user_id` 联合唯一，与订单幂等键一致 |
 | `activity_id` / `user_id` | `BIGINT UNSIGNED` | |
-| `status` | `TINYINT` | 0=QUEUED，1=ORDERED，2=REJECTED，3=FAILED |
+| `status` | `TINYINT` | 1=ORDERED，2=REJECTED，3=FAILED；排队态主要在 Redis |
 | `order_id` | `BIGINT UNSIGNED` NULL | 落单后回填 |
+| `error_code` | `VARCHAR(64)` NULL | 拒绝/失败的稳定机器码，不存异常堆栈 |
 | `created_at` / `updated_at` | `DATETIME(3)` | |
 
-注意：这张表**不能修复 Redis 丢消息**。若产品向用户承诺"受理即持久"，就必须在返回前完成 MySQL 写入（那就退回同步语义），或用可查询的补偿状态 + 明确文案。
+键：`UNIQUE(user_id,request_id)` 保证请求幂等；`KEY(activity_id,user_id,status)` 支持定位用户在活动中的请求。最终一人一单只由 `purchase_order.UNIQUE(activity_id,user_id)` 兜底，不能让一次系统级 `FAILED` 永久阻止用户重试。`ORDERED` 必须有 `order_id`，其他终态必须为空。
+
+注意：这张表不参与 API 入口同步写入，否则会把每个洪峰请求重新压到 MySQL。系统只在 Kafka ACK 后承诺“已受理”，Consumer 处理后落最终结果；Redis 状态丢失时必须显示 `PROCESSING/RECOVERING`，不能伪造失败。
 
 ### 8.3 D 阶段：`outbox_event` / `processed_message`
 
-仅在出现**独立下游**（通知、统计、对账系统）时引入。`outbox_event` 与业务写入同事务提交，Publisher 异步投递，消费者靠 `processed_message` 幂等。**V1 不建**：没有消费者时它只是一个多写的热点表。
+仅在出现**独立下游**（通知、统计、对账系统）时引入。`outbox_event` 与业务写入同事务提交，Publisher 异步投递，消费者靠 `processed_message` 幂等。它发布的是订单事实事件，与 F9 的秒杀命令 Topic 职责不同。**V1 不建**：没有消费者时它只是一个多写的热点表。
 
 ### 8.4 真实支付接入
 
@@ -689,24 +707,24 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 
 ---
 
-## 10. 与现有文档的冲突及推荐
+## 10. 已解决的跨文档冲突（C-1～C-12）
 
-| 编号 | 冲突点 | `PROJECT_SPEC.md` 现状 | V3 稿 | 推荐 | 影响 |
+| 编号 | 冲突点 | 原 `PROJECT_SPEC.md` | V3 稿 | 最终决议 | 落点 |
 |---|---|---|---|---|---|
-| C-1 | 表名 | `users`/`token_product`/`orders`（标注为"建议名"） | `app_user`/`token_package`/`purchase_order` | **采用 V3 命名**：`order` 是 MySQL 保留字，`user` 虽非保留字但与 `USER()` 函数易混，物理表名必须避开 | 需同步 SPEC 的表格 |
-| C-2 | 额度字段 | `token_amount` | `credit_amount` | 采用 `credit_amount`（避免与"模型 token"混淆） | SPEC 术语调整 |
-| C-3 | 金额字段 | `amount_cent` / `sale_price_cent` | `pay_amount_cent` / `activity_price_cent` | 采用后者，语义更明确 | 文档级 |
+| C-1 | 表名 | `users`/`token_product`/`orders`（标注为"建议名"） | `app_user`/`token_package`/`purchase_order` | **采用 V3 命名**：`order` 是 MySQL 保留字，`user` 虽非保留字但与 `USER()` 函数易混，物理表名必须避开 | 已同步 SPEC |
+| C-2 | 额度字段 | `token_amount` | `credit_amount` | 采用 `credit_amount`（避免与"模型 token"混淆） | 已同步 SPEC |
+| C-3 | 金额字段 | `amount_cent` / `sale_price_cent` | `pay_amount_cent` / `activity_price_cent` | 采用后者，语义更明确 | 已同步 SPEC |
 | C-4 | 订单状态值 | `UNPAID/PAID/CLOSED`（概念） | 0/1/2 | 采用 `TINYINT`，Java 枚举名保留 `UNPAID/PAID/CLOSED` | API 输出仍为字符串 |
-| C-5 | `order_no` | 要求 `order_no UNIQUE` | 建议直接用 `id` 当单号 | **保留 `order_no`**：对外不可枚举，且 SPEC 已约定；代价是 1 个二级索引 | 与 V3 冲突，需用户确认（Q2） |
+| C-5 | `order_no` | 要求 `order_no UNIQUE` | 建议直接用 `id` 当单号 | **保留 `order_no`**：对外不可枚举；代价是 1 个二级索引 | 已同步 SPEC/API（Q2） |
 | C-6 | `payment_record` | 表中列出 | 不建 | **V1 不建**（模拟支付无外部单号） | 真实支付时新增 |
 | C-7 | `purchase_qualification` | 表中列出但注明"可简化" | 不建 | **不建**，用 `UNIQUE(activity_id,user_id)` | 无 |
 | C-8 | `seckill_activity.version` | 列出 `version` | 未含 | **不加**：活动行在秒杀期间不更新 | 无 |
 | C-9 | 普通购买 | V1 必须实现清单**未包含**普通购买 | 列入首期 | **已定（2026-10-20，方案 B）**：纳入 V1，接口与 Service 分开、表共用；`activity_id` 可空 + `order_type` 保留。依据 §14、§15 | 2 个字段，不影响性能 |
 | C-10 | `users.role` | 有 `role` | V3 缺失 | **补 `role TINYINT`** | 若无此字段，管理员接口无法实现 |
 | C-11 | `sold_stock` | 表中列出（"必要时保留"） | 不落库 | **不落库**，计算得出 | 少一个字段、少一次写 |
-| C-12 | 时间精度 | 未规定 | `DATETIME(3)` | 采用 `DATETIME(3)` + UTC | 需在 SPEC 明确 |
+| C-12 | 时间精度 | 未规定 | `DATETIME(3)` | 采用 `DATETIME(3)` + UTC | 已同步 SPEC |
 
-> 以上 C-1~C-12 待用户确认后，再一次性更新 `PROJECT_SPEC.md` 的 §6 表结构章节（本轮不改 SPEC，避免设计阶段反复漂移）。
+> C-1～C-12 已于 2026-10-20 全部采纳并同步到 `PROJECT_SPEC.md`；本表只保留决策来历，不再表示待确认事项。
 
 ---
 
@@ -719,12 +737,15 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V1 | `V1__create_schema_probe.sql` | F0-2（已完成） | 连通性探针 |
 | V2 | `V2__drop_schema_probe.sql` | F1 | 删除探针表 |
 | V3 | `V3__create_app_user.sql` | F1 | `app_user` |
-| V4 | `V4__create_token_package.sql` | F2 | `token_package` |
-| V5 | `V5__create_seckill_activity.sql` | F3 | `seckill_activity` |
-| V6 | `V6__create_activity_inventory.sql` | F3 | `activity_inventory` |
-| V7 | `V7__create_purchase_order.sql` | F4 | `purchase_order` |
-| V8 | `V8__create_token_account.sql` | F5 | `token_account` |
+| V4 | `V4__create_token_account.sql` | F1 | `token_account`；注册与用户同事务创建 |
+| V5 | `V5__create_token_package.sql` | F2 | `token_package` |
+| V6 | `V6__create_seckill_activity.sql` | F3 | `seckill_activity` |
+| V7 | `V7__create_activity_inventory.sql` | F3 | `activity_inventory` |
+| V8 | `V8__create_purchase_order.sql` | F4 | `purchase_order` |
 | V9 | `V9__create_token_ledger.sql` | F5 | `token_ledger` |
+| V10 | `V10__create_outbox_event.sql` | F8 | 事务后事件 Outbox |
+| V11 | `V11__create_processed_message.sql` | F8 | 独立下游消费幂等 |
+| V12 | `V12__create_seckill_request.sql` | F9 | 异步秒杀最终请求结果 |
 
 ### 11.2 规则
 
@@ -733,11 +754,11 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 3. 表结构变更与 DTO/API 变更放同一个垂直功能提交。
 4. `total_stock` 一旦发布不可改：若必须调整，属于新活动，而不是 `UPDATE` 老活动库存。
 5. 禁止在任何环境执行 `flyway clean` / `DROP DATABASE`；测试库重建只能由人工确认执行。
-6. **普通购买不新增表、不新增迁移**：`V7__create_purchase_order.sql` 一次性建好 `order_type` 与可空 `activity_id`，F4 之后接普通购买时只加代码不加列。
+6. **普通购买不新增表、不新增迁移**：`V8__create_purchase_order.sql` 一次性建好 `order_type` 与可空 `activity_id`，F4 之后接普通购买时只加代码不加列。
 
 ---
 
-## 12. 业务规则：已定与待确认
+## 12. 业务规则：Q1～Q8 全部已定
 
 ### 12.1 已定（用户确认，2026-10-20）
 
@@ -745,17 +766,17 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 |---|---|---|
 | Q1 | 普通购买是否在 V1 落地？ | **落地**。采用 §15 的**方案 B**：两个下单入口 + 两个 Service + 共用 `purchase_order`；`activity_id` 可空、`order_type` 保留。实施顺序排在秒杀通路之后（见 §15.8） |
 
-### 12.2 待确认（各自阻塞的任务见"影响"列）
+### 12.2 已定（本轮收敛，2026-10-20）
 
-| 编号 | 问题 | 我的建议 | 影响 |
+| 编号 | 问题 | 最终决议 | 实施影响 |
 |---|---|---|---|
-| Q2 | **订单对外标识**用不可枚举的 `order_no`，还是直接用自增 `id`？ | 建议 `order_no`（多 1 个索引写，换不可枚举与稳定契约） | F4 建表 |
-| Q3 | 秒杀**一人一单**是"每活动限一次"还是"每活动每套餐一次"？取消后能否再抢？ | 建议：每活动一次，取消/超时后**不可再抢**（与 SPEC 一致） | F4 唯一键与错误码 |
-| Q4 | 用户名是否**大小写不敏感**（`Alice` 与 `alice` 同一人）？ | 建议不敏感，防冒名 | **F1 建表（排序规则）** |
-| Q5 | 活动是否允许**不结束**（`end_at` 空表示长期有效）？ | 建议必须有 `end_at`，长期活动给远期时间 | F3 建表 |
-| Q6 | 超时未支付的默认时长（15 分钟？） | 建议 15 分钟，做成配置项而非硬编码 | F4/F6 |
-| Q7 | 管理员是否需要**禁用用户**（`app_user.status`）？ | 建议保留字段，V1 只做登录校验 | F1 |
-| Q8 | `token_account` 在注册时创建，还是支付时懒创建？ | **分阶段**：F1 建 `app_user`（此时账户表不存在），只写用户；F5 引入 `token_account` 的迁移里用 `INSERT ... SELECT` 为既有用户补建账户，此后注册事务同时建账户 | F1/F5 迁移顺序 |
+| Q2 | 对外订单标识 | 使用不可枚举 `order_no`；自增 `id` 永不出现在 HTTP 路径 | F4 多 1 个唯一索引，换稳定安全契约 |
+| Q3 | 一人一单范围与重抢 | 每活动每用户最多一次；关闭/超时后不可重抢 | F4 `UNIQUE(activity_id,user_id)` 与稳定 409 错误码 |
+| Q4 | 用户名大小写 | 不敏感，`Alice` 与 `alice` 同一账号 | F1 使用 `utf8mb4_0900_ai_ci` 唯一索引 |
+| Q5 | 活动结束时间 | `end_at` 必填，且 `start_at < end_at`；常规长期售卖走普通购买 | F3 NOT NULL + CHECK |
+| Q6 | 未支付超时 | 默认 15 分钟、配置化，建单时固化 `expires_at` | F4/F6 共用服务端 `Clock` |
+| Q7 | 禁用用户 | 保留 `status`；V1 拒绝禁用用户新登录，热请求不逐次回表，存量 JWT 到期失效 | F1 明确性能与安全边界 |
+| Q8 | 账户创建 | F1 同时创建 `app_user` 与 `token_account`，注册事务保证一一对应；不采用支付时懒创建 | 低频注册多 1 次写，支付热路径无补建分支，也无 F5 回填竞态 |
 
 ---
 
@@ -764,7 +785,7 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 - 未创建任何业务表，未写 Flyway 建表 SQL（`V2` 之后都在 F1 及后续任务里执行）。
 - 未新增 Controller / Service / Mapper / Entity。
 - 未实现 Redis Lua、Kafka 消费者、压测脚本。
-- 未修改 `PROJECT_SPEC.md`（C-1~C-12 待确认后统一更新，避免设计反复）。
+- 已同步 `PROJECT_SPEC.md`、`DEVELOPMENT_PLAN.md`、`ENGINEERING_STANDARDS.md` 与 `HIGH_CONCURRENCY_DESIGN.md`；本轮仍未写迁移或业务代码。
 - 未对 `TokenMarket` 仓库做结构断言：本轮网络无法访问该仓库（HTTP 404/连接失败），因此不引用其表设计；黑马点评的实际表结构分析见 §14（`hmdp.sql` 已完整读取）。
 
 ---
@@ -927,5 +948,5 @@ NormalOrderService.place():   @Transactional
 | 关联 | Q1（普通购买纳入 V1）、C-9、§14.5 |
 | 不采用 | 手写 Singleton（破坏 DI/事务代理）；现在引入 Strategy（差异只有一步）；订单分表（方案 C，代价见 §15.4） |
 | 后果 | `purchase_order` 保留 `order_type` 与可空 `activity_id`；`uk_activity_user` 依赖 NULL 不参与唯一，天然放过普通订单 |
-| 实施顺序 | 秒杀下单（F4）→ **普通购买下单（F4 之后、F5 之前）** → 模拟支付与钱包（F5）→ 超时关闭（F6）。`docs/DEVELOPMENT_PLAN.md` 是否显式拆出"普通购买"任务，需用户确认后再改计划文件 |
+| 实施顺序 | 秒杀下单（F4）→ **普通购买下单（F4.5）** → 模拟支付与钱包（F5）→ 超时关闭（F6）；`docs/DEVELOPMENT_PLAN.md` 已同步 |
 | 复审触发 | 出现第三种售卖形态，或两条线路差异变成多步不同顺序时，回到 §15.6 |
