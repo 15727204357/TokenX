@@ -43,7 +43,16 @@
 
 ## Phase 1：身份与套餐
 
-### [ ] F1 注册与登录
+### [x] F1 注册与登录
+
+> 完成记录（2026-10-20，分支 `feature/F1-auth`）：
+> 迁移 `V2__drop_schema_probe` / `V3__create_app_user` / `V4__create_token_account` 已应用；注册在同一事务内写
+> `app_user` + 零余额 `token_account`，失败整体回滚；登录签发 HS256 JWT，鉴权全本地验签，`/users/me` 只读 claims。
+> `./mvnw clean verify` 35 个测试通过（真实 MySQL `tokenx_test`）；前端 `pnpm lint` / `pnpm test`(3) / `pnpm build` 通过。
+> 空库 bootstrap 用独立临时 MySQL 9.7.2 实例（端口 3307，验证后已销毁）实测：V1→V4 全部应用、二次启动
+> `No migration necessary`、历史保持 4 条；本机应用账号无 `CREATE/DROP DATABASE` 权限，故该场景不进自动化套件，
+> 复现命令：`mysqld --initialize-insecure --datadir=<tmp>/data` 启动实例后
+> `TOKENX_JWT_SECRET=... TOKENX_DB_USERNAME=root TOKENX_DB_PASSWORD= ./mvnw spring-boot:run -Dspring-boot.run.arguments="--spring.datasource.url=jdbc:mysql://127.0.0.1:3307/<db>?...&createDatabaseIfNotExist=true"`。
 
 **范围**：注册、密码哈希、登录、JWT 鉴权、`/users/me`；用户名大小写不敏感；用户角色与状态枚举。注册事务同时创建 `app_user` 与零余额 `token_account`，但钱包接口仍留到 F5。在 React 增加最小登录页面（允许样式极简）。
 
@@ -133,4 +142,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F1。
+> F0-1～F0-3、F1 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F2。

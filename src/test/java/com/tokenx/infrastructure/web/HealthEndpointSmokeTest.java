@@ -7,18 +7,17 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import com.tokenx.support.AbstractIntegrationTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
-import org.springframework.test.context.ActiveProfiles;
 
 /**
  * Smoke test against a real servlet container and real HTTP, so that "the application serves
  * requests" is proven without relying on an external client tool.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@ActiveProfiles("test")
-class HealthEndpointSmokeTest {
+class HealthEndpointSmokeTest extends AbstractIntegrationTest {
 
   @LocalServerPort private int port;
 

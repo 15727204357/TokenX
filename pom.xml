@@ -34,6 +34,21 @@
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
+    <!-- F1 authentication: standard Spring Security stack, no third-party JWT library. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <!-- Provides Nimbus JWT encode/decode so tokens are verified locally (no per-request DB hit). -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security-oauth2-resource-server</artifactId>
+    </dependency>
+
     <!-- Persistence: database is the source of truth for every trade (PROJECT_SPEC §5). -->
     <dependency>
       <groupId>com.baomidou</groupId>

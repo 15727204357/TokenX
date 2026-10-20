@@ -2,33 +2,44 @@ package com.tokenx.infrastructure.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.tokenx.support.AbstractIntegrationTest;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.MigrationState;
 import org.flywaydb.core.api.output.MigrateResult;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.test.context.ActiveProfiles;
 
 /**
- * Verifies the versioned migration really ran and that running it again changes nothing.
+ * Verifies the versioned migrations really ran on real MySQL and that running them again changes
+ * nothing.
  *
- * <p>Run against {@code tokenx_test} only. A clean-database run is done manually (see the F0-2
- * report) because it requires dropping the schema, which no test is allowed to do.
+ * <p>Runs against {@code tokenx_test} only. A from-scratch bootstrap needs an empty schema; the test
+ * account cannot create or drop databases, so that run is documented as a manual step in the README
+ * instead of being faked here.
  */
 @SpringBootTest
-@ActiveProfiles("test")
-class FlywayMigrationTest {
+class FlywayMigrationTest extends AbstractIntegrationTest {
 
   @Autowired private Flyway flyway;
-  @Autowired private SchemaProbeMapper mapper;
+  @Autowired private DataSource dataSource;
 
   @Test
-  void shouldHaveAppliedV1WithoutFailure() {
-    assertThat(flyway.info().applied())
-        .as("V1 migration must be recorded in flyway_schema_history")
-        .anySatisfy(info -> assertThat(info.getVersion().getVersion()).isEqualTo("1"));
+  void shouldHaveAppliedEveryMigrationWithoutFailure() {
+    List<String> applied =
+        Arrays.stream(flyway.info().applied())
+            .map(info -> info.getVersion().getVersion())
+            .toList();
+
+    assertThat(applied).contains("1", "2", "3", "4");
 
     assertThat(flyway.info().all())
         .as("no migration may be in a failed state")
@@ -45,9 +56,24 @@ class FlywayMigrationTest {
   }
 
   @Test
-  void shouldExposeMigratedTableThroughMapper() {
-    assertThat(mapper.selectCount(Wrappers.<SchemaProbe>lambdaQuery()))
-        .as("migrated table must be queryable")
-        .isNotNegative();
+  void shouldReplaceTheF0ProbeTableWithTheAccountTables() throws SQLException {
+    assertThat(existingTables())
+        .contains("app_user", "token_account")
+        .doesNotContain("schema_probe");
+  }
+
+  private List<String> existingTables() throws SQLException {
+    List<String> tables = new ArrayList<>();
+    try (Connection connection = dataSource.getConnection();
+        Statement statement = connection.createStatement();
+        ResultSet rs =
+            statement.executeQuery(
+                "SELECT table_name FROM information_schema.tables "
+                    + "WHERE table_schema = DATABASE()")) {
+      while (rs.next()) {
+        tables.add(rs.getString(1));
+      }
+    }
+    return tables;
   }
 }

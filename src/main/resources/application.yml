@@ -27,10 +27,21 @@ spring:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
+    # Persist UserRole/UserStatus as their numeric code, not as the enum name.
+    default-enum-type-handler: com.baomidou.mybatisplus.core.handlers.MybatisEnumTypeHandler
   global-config:
     banner: false
     db-config:
       id-type: auto
+
+tokenx:
+  auth:
+    jwt:
+      # No default on purpose: supply TOKENX_JWT_SECRET, or put the value in the git-ignored
+      # application-local.yml. The application refuses to start with a shorter key.
+      secret: ${TOKENX_JWT_SECRET:}
+      # Already-issued tokens stay valid until they expire; there is no revocation list in V1.
+      ttl: ${TOKENX_JWT_TTL:1h}
 
 server:
   port: 8080
