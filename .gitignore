@@ -1,0 +1,47 @@
+# macOS / IDE
+.DS_Store
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+
+# Java / Maven
+target/
+**/target/
+*.class
+*.log
+logs/
+
+# React / Node / Vite
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+**/coverage/
+.vite/
+*.tsbuildinfo
+
+# Local configuration and secrets (keep examples)
+.env
+.env.*
+!.env.example
+!.env.*.example
+**/application-local.yml
+**/application-local.yaml
+**/application-local.properties
+**/application-*.local.yml
+**/application-*.local.yaml
+*.pem
+*.key
+
+# Local database / runtime artifacts
+*.pid
+*.hprof
+*.db
+*.sqlite
+*.sqlite3
+
+# Do NOT ignore: mvnw, .mvn/wrapper, pom.xml, pnpm-lock.yaml,
+# versioned SQL migrations, docs, tests, compose manifests.
