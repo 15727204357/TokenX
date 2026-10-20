@@ -1,0 +1,11 @@
+# Example of the local override file. Copy to `application-local.yml` (same directory) and set your
+# own local database password. `application-local.yml` is git-ignored; this example is not.
+#
+# Keep ONLY the password here: the JDBC URL and username are declared in application.yml (dev) and
+# application-test.yml (tests), so this file must not override them.
+#
+# The application account is a dedicated local user (never root) that owns only the `tokenx` and
+# `tokenx_test` databases. See README "本地数据库准备".
+spring:
+  datasource:
+    password: "<your-local-password>"

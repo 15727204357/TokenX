@@ -21,7 +21,12 @@
 
 **验收**：`./mvnw clean verify` 成功；`curl http://localhost:8080/api/v1/health` 返回预期；`mvn -version` 指向 Java21；明确列出实际参考的黑马点评仓库文件和适配差异；`git diff --check` 通过、仅提交本任务文件并报告本地 Commit SHA；不自动 push/merge。**做完停下**。
 
-### [ ] F0-2 最小依赖连通与迁移验证
+### [x] F0-2 最小依赖连通与迁移验证
+
+> 完成记录（2026-10-20，分支 `feature/F0-2-db-migration`）：
+> MySQL 9.7.2 + MyBatis-Plus 3.5.17 + Flyway 12.4.0 真实连通，`tokenx_test` 空库迁移至 v1 成功；
+> 重跑 0 迁移、`flyway_schema_history` 仅 1 条记录；Redis 8.10.2 PING 通过；
+> 版本锁定见 `docs/VERSION_LOCK.md`（Kafka 仅登记未接入）；`./mvnw clean verify` 9 个测试通过。
 
 **范围**：只加 MySQL/MyBatis-Plus、Redis 必需依赖；用独立 test profile 连接真实组件。验证 MySQL9.7 和 Flyway 实际兼容，写最小迁移及回归测试；Redis 做 `PING` 级连接验证。Kafka 仅列入版本锁定文档，暂不接入代码。
 

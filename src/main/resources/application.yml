@@ -2,6 +2,36 @@ spring:
   application:
     name: tokenx
 
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/tokenx?sslMode=DISABLED&allowPublicKeyRetrieval=true&characterEncoding=utf8&connectionTimeZone=UTC
+    username: ${TOKENX_DB_USERNAME:tokenx}
+    # Never put a real password here: use application-local.yml (git-ignored) or the env var.
+    password: ${TOKENX_DB_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 3000
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # An existing, unmanaged database must never be baselined silently.
+    baseline-on-migrate: false
+
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 2s
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
 server:
   port: 8080
   shutdown: graceful
