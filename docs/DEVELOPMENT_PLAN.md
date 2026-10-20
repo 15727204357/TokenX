@@ -12,7 +12,10 @@
 
 ## Phase 0：代码仓库与基础兼容（此为 Qoder 第一次任务）
 
-### [ ] F0-1 建立最小可运行后端仓库
+### [x] F0-1 建立最小可运行后端仓库
+
+> 完成记录（2026-10-20，分支 `feature/F0-1-bootstrap`）：骨架、健康检查、测试、README 与
+> `docs/REFERENCE_MAPPING.md` 已提交；`./mvnw clean verify` 3 个测试通过（含真实端口 HTTP 冒烟）。
 
 **范围**：研究黑马点评的结构并写“参考映射”，建立 Java21、Spring Boot4.1.1、Maven Wrapper 的**单模块**最小后端，Spring MVC 一个 `/api/v1/health` 接口，规范 README、`.gitignore`、`.gitattributes`、`.editorconfig`，并依 `docs/GIT_WORKFLOW.md` 建立最小本地 Git 基线和 `feature/F0-1-bootstrap` 分支。不创建秒杀表、不接入 Kafka、不搭建管理后台。
 

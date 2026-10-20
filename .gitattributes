@@ -2,6 +2,7 @@
 * text=auto
 *.sh text eol=lf
 mvnw text eol=lf
+mvnw.cmd text eol=crlf
 *.bat text eol=crlf
 *.sql text eol=lf
 *.yml text eol=lf
