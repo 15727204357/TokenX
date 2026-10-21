@@ -2,11 +2,12 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3` 完成——最小可运行骨架、MySQL 迁移链路、Redis 连通性、
-> 数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
-> （管理员创建/上下架、游客游标分页列表与详情、公开列表页），以及秒杀活动配置与库存初始化
-> （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态）。
-> 秒杀下单、订单、支付与钱包接口尚未实现（F4 起）。
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4` 完成——最小可运行骨架、MySQL 迁移链路、
+> Redis 连通性、数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
+> （管理员创建/上下架、游客游标分页列表与详情、公开列表页），秒杀活动配置与库存初始化
+> （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），以及**同步秒杀下单**
+> （MySQL 条件扣库存 + 唯一键一人一单 + 幂等键重放、订单详情页）。
+> 支付与钱包接口尚未实现（F5 起），订单超时关闭在 F6。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -214,6 +215,61 @@ curl -s http://localhost:8080/api/v1/activities/1
 - 每人每活动最多一单是项目固定规则（F4 用唯一键落实），响应里固定返回 `purchaseLimit = 1`，
   不为此增加一个只能取 1 的数据库列。
 
+## 下单接口（F4）
+
+**这一步是 MySQL 强一致基线**：判断谁抢到的只有数据库语句本身。正确性路径上**没有** Redis 预扣、
+Kafka/消息队列、本地内存队列或分布式锁——下单结果与并发量无关，只与库存行和唯一键有关。
+
+| 方法 | 路径 | 说明 | 成功 | 主要失败 |
+|---|---|---|---|---|
+| POST | `/activities/{id}/orders` | 秒杀下单（需登录）。**无请求体**；必须带 `Idempotency-Key`（规范 36 位 UUID） | `201`（本次创建）或 `200`（同一 key 重放，不扣库存） | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_NOT_ACTIVE` / `ACTIVITY_SOLD_OUT` / `ALREADY_PURCHASED` / `IDEMPOTENCY_KEY_REUSED` |
+| GET | `/orders/{orderNo}` | 查询**自己的**订单（需登录） | `200` 订单快照 | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ORDER_NOT_FOUND`（不存在与他人订单完全一致） |
+
+```bash
+# 下单：单号由服务端生成，客户端只提供幂等键
+curl -s -X POST "http://localhost:8080/api/v1/activities/1/orders" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: $(uuidgen | tr 'A-Z' 'a-z')"
+# 201 -> {"orderNo":"...","orderType":"SECKILL","status":"UNPAID","payAmountCent":799,...}
+
+# 查询自己的订单
+curl -s http://localhost:8080/api/v1/orders/<orderNo> -H "Authorization: Bearer $TOKEN"
+```
+
+要点：
+
+- **事务与加锁顺序固定**：① 按 `(user_id, request_id)` 查已有订单 → ② `seckill_activity` 主键
+  `FOR SHARE` 读出活动快照 → ③ 校验 `PUBLISHED` 且 `now ∈ [start_at, end_at)` → ④ 在库存锁**之前**
+  备好订单号、支付截止与全部快照 → ⑤ 条件 `UPDATE activity_inventory … WHERE available_stock > 0`
+  → ⑥ `INSERT purchase_order` → ⑦ `COMMIT` → ⑧ 提交成功后才返回 `201`。
+- **扣库存靠影响行数，不靠先查后改**：`available_stock > 0` 写在 `UPDATE` 条件里，影响 0 行即
+  `409 ACTIVITY_SOLD_OUT`，此时不插订单、不开后续写；`UNSIGNED` 列与 `CHECK` 是最后防线，库存不会为负。
+- **一人一活动一单由唯一键永久保证**：`uk_activity_user (activity_id, user_id)`。服务端不做
+  `(activity_id, user_id)` 预查——它不可能权威，只会给热路径多加一次读，真正的判定仍然是同一个唯一键。
+- **唯一键冲突必须整体回滚**：订单 `INSERT` 是事务最后一句，冲突意味着 ⑤ 的预占也必须消失。
+  吞掉 `DuplicateKeyException` 继续提交会留下“库存被扣但没有订单”的脏数据。因此事务完整回滚，
+  再在**事务边界之外**（独立的只读事务）判定原因：命中同一幂等键 → 同活动返回原订单 `200`、
+  异活动 `409 IDEMPOTENCY_KEY_REUSED`；否则命中 `(activity_id, user_id)` → `409 ALREADY_PURCHASED`；
+  两者都没有则只可能是订单号撞号，换号重试且有次数上限，超限如实报错。
+- **`201` 与 `200` 语义不同**：`201` 表示本次请求真的创建了订单并预占了库存；`200` 表示同一幂等键
+  早先已创建，本次只是重放，**没有再次扣库存**。因此“网络超时后重试”是安全的：复用同一个键即可。
+- **已有订单优先于活动状态**：重放判定在活动校验之前，所以活动结束后、下架后，原先的订单仍然能按同一
+  幂等键取回，不会因为活动不可售而丢掉一张已存在的单。
+- **`order_no` 不可枚举**：应用侧生成 26 位 Crockford Base32（前 10 位是毫秒时间、后 16 位是 80 位
+  密码学随机数），不带业务含义、相邻单号无法推算；**不使用**数据库序列表（那会变成新的全局热点）。
+  所有 HTTP 路径只接受 `order_no`，自增 `id`、`user_id`、`request_id`、数字状态码都不出现在响应里。
+- **金额与额度是快照**：`pay_amount_cent`、`credit_amount`、`package_name_snapshot` 全部由服务端在
+  创建时写入，之后活动改价或套餐改价都不影响既有订单；请求体（即使客户端强行带上）不会被采纳。
+- **支付截止时间**由 `tokenx.order.payment-timeout`（默认 `15m`）在创建时固化：
+  `expires_at = created_at + 配置时长`，之后修改配置只影响新订单。全过程只用注入的服务端 `Clock`
+  （截断到毫秒），客户端时间不参与任何判断。
+- **已下架套餐不影响已发布活动**：下单只读套餐名做快照，不重新校验 `ON_SALE`——套餐下架是“不再新开活动”，
+  不是“已发布的活动立刻失效”。
+- 本阶段订单只有 `UNPAID`：没有支付、没有超时关闭、没有库存释放（F5 / F6）。
+- 并发相关的集成测试（真实 MySQL、真实并发请求）验证的是**正确性**：成功数等于初始库存、
+  `available_stock` 不为负、`reserved_stock` 等于成功数、失败只返回稳定业务码、不出现 500。
+  这些数字**不是** QPS/TPS 压测结果，不得当作性能指标引用。
+
 ## 前端（`frontend/`）
 
 ```bash
@@ -226,13 +282,19 @@ pnpm build
 ```
 
 页面：登录 / 注册并登录、当前用户、公开的套餐列表 `/products`（未登录可访问，展示名称、Token
-额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页），以及公开的活动详情
+额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页）、公开的活动详情
 `/activities/:id`（展示活动价、Token 额度、起止时间、可用库存与 `UPCOMING`/`ACTIVE`/`ENDED`；
-库存为 0 时显示“已售罄”；本阶段没有抢购按钮）。Token 存在浏览器 `localStorage`，由统一的 HTTP
-拦截器附加到请求头。
+库存为 0 时显示“已售罄”），以及订单详情 `/orders/:orderNo`（展示服务端快照：单号、套餐、额度、
+应付金额与支付截止）。Token 存在浏览器 `localStorage`，由统一的 HTTP 拦截器附加到请求头。
+
+活动页的抢购按钮只在服务端返回 `ACTIVE` 且未售罄时可点，其余状态按钮禁用并写明原因（即将开始 /
+活动已结束 / 已售罄）；未登录点击跳转登录页，登录后点击才真正下单。每次下单用浏览器原生
+`crypto.randomUUID()` 生成幂等键；**网络中断或 5xx 之后重试复用同一个键**（服务端可能已经建单），
+而业务拒绝（如已购买、已售罄）视为明确答复，下一次尝试会换新键。
 
 活动页只展示服务端返回的 `runtimeStatus`，不在浏览器里比较时间来判断活动是否开始——否则前端与
-后端会在边界时刻给出不同答案。时间按 `Asia/Shanghai`（UTC+8）格式化，仅用于展示。
+后端会在边界时刻给出不同答案。时间按 `Asia/Shanghai`（UTC+8）格式化，仅用于展示。订单页同样
+不做倒计时：支付截止时间是服务端固化的事实，浏览器再算一遍只会制造第二个「真相」。
 
 ## 数据库迁移
 
@@ -240,17 +302,20 @@ pnpm build
 - 应用启动时由 Flyway 自动执行；**禁止**手工改已发布的迁移文件，也禁止用 ORM 自动建表覆盖。
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
   `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
-  `activity_inventory`（F3）。
+  `activity_inventory`（F3）、`V8` `purchase_order`（F4）。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V7 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V8 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥
 
 - 默认配置在 `src/main/resources/application.yml`，**不包含任何真实密码或密钥**。
 - 本地覆盖配置放在 `application-local.yml`（已忽略），或通过 `TOKENX_DB_USERNAME` /
-  `TOKENX_DB_PASSWORD` / `TOKENX_JWT_SECRET` / `TOKENX_JWT_TTL` 环境变量注入。
+  `TOKENX_DB_PASSWORD` / `TOKENX_JWT_SECRET` / `TOKENX_JWT_TTL` /
+  `TOKENX_ORDER_PAYMENT_TIMEOUT` 环境变量注入。
 - `tokenx.auth.jwt.secret` 少于 32 字符时应用启动失败：这是有意的，避免用弱密钥或空密钥上线。
+- `tokenx.order.payment-timeout`（默认 `15m`）必须为正且不超过 `24h`，否则应用启动失败：
+  “永不过期”的订单比启动失败更糟。该值在创建订单时固化进 `expires_at`。
 - JWT Secret、数据库账号密码等只能通过本地配置/环境变量提供，禁止提交到 Git。
 
 ## 目录结构
@@ -262,8 +327,10 @@ src/main/java/com/tokenx/
 │   ├── controller/  service/  mapper/  model/  dto/
 ├── catalog/                        F2 套餐模块：创建、上下架、公共列表与详情
 │   ├── controller/  service/  mapper/  model/  dto/
-├── activity/                       F3 活动模块：创建、发布/下架、公开详情
+├── activity/                       F3 活动模块：创建、发布/下架、公开详情、活动快照与条件扣库存
 │   ├── controller/  service/  mapper/  model/  dto/
+├── order/                          F4 订单模块：同步秒杀下单、幂等键、订单查询
+│   ├── controller/  service/  mapper/  model/  dto/  support/  config/
 └── infrastructure/                 通用基础设施（安全、异常转换、时间源、外部适配）
     ├── web/                        健康检查、统一错误、requestId
     ├── security/                   Spring Security 配置、JWT 签发与本地验签
@@ -273,12 +340,12 @@ src/main/java/com/tokenx/
 src/main/resources/
 ├── application.yml                 默认配置（无密码、无密钥）
 ├── db/migration/                   Flyway 版本化迁移
-src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog/activity 为真实 MySQL 集成测试）
+src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog/activity/order 为真实 MySQL 集成测试）
 frontend/                           React 19 + TS + Vite 前端
 docs/                               需求、工程规范、实施计划、Git 工作流、版本锁定
 ```
 
-业务模块（`order`、`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
+业务模块（`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
 
 ## 项目文档
 

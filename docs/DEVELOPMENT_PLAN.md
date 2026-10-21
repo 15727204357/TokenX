@@ -102,7 +102,28 @@
 
 ## Phase 2：完整同步交易闭环（最重要）
 
-### [ ] F4 同步秒杀下单（MySQL 基线）
+### [x] F4 同步秒杀下单（MySQL 基线）
+
+> 完成记录（2026-10-21，分支 `feature/F4-sync-seckill-order`）：
+> 迁移 `V8__create_purchase_order` 已应用：16 列（`order_no CHAR(26) ascii_bin`、`request_id BINARY(16)`、
+> 可空 `activity_id`、`order_type`、价格/额度快照、`status`、`expires_at`/`paid_at`/`closed_at`）、
+> 5 个二级索引（`uk_order_no`、`uk_user_request(user_id,request_id)`、`uk_activity_user(activity_id,user_id)`、
+> `idx_order_user`、`idx_order_timeout(status,expires_at)`）与 8 条 `CHECK`；无物理外键、无 `version`、
+> 无 Redis/Kafka 列、无序列表。
+> `POST /activities/{id}/orders` 无请求体，`Idempotency-Key` 必须是规范 UUID（否则 400），身份只取自 JWT；
+> 本次创建 `201`，同键重放 `200` 且不再扣库存；错误码为 `ACTIVITY_NOT_FOUND`(404)、
+> `ACTIVITY_NOT_ACTIVE`/`ACTIVITY_SOLD_OUT`/`ALREADY_PURCHASED`/`IDEMPOTENCY_KEY_REUSED`(409)。
+> 事务顺序：查 `(user_id,request_id)` → 活动主键 `FOR SHARE` → 校验 `PUBLISHED` 且 `now∈[start,end)`
+> → 备好单号/截止时间/快照 → 条件 `UPDATE … WHERE available_stock>0` → `INSERT` → 提交后返回；
+> 唯一键冲突整体回滚，再在事务之外用只读事务判定重放/换键/一人一单，订单号撞号有限次重试。
+> `order_no` 为 26 位 Crockford Base32（毫秒时间前缀 + 80 bit 随机尾）；`expires_at = created_at +`
+> `tokenx.order.payment-timeout`（默认 `15m`，启动校验正数且 ≤24h），创建时固化。
+> `GET /orders/{orderNo}` 只查本人订单，不存在与他人订单同为 404；自增 `id`/`user_id`/`request_id`/
+> 数字状态码不出现在任何响应中。React 活动页新增“立即抢购”（仅 `ACTIVE` 且未售罄可点，未登录跳登录页，
+> 网络失败重试复用同一幂等键），并新增订单详情页（服务端快照，无支付按钮、无倒计时）。
+> `./mvnw clean verify` 179 个测试通过（新增 51 个，真实 MySQL `tokenx_test`，含并发不超卖、并发幂等、
+> 强制订单插入失败后库存回滚、`FOR SHARE` 被 `FOR UPDATE` 阻塞后读到最新状态）；前端
+> `pnpm lint` / `test`(28) / `build` / `format:check` 通过。
 
 **范围**：用户在活动时间内下单；MySQL 条件扣可用库存 + 建立待支付订单 + 唯一约束，形成可靠同步版本；生成不可枚举 `order_no`，默认 15 分钟超时（配置化）；按 `orderNo` 查询订单。
 
@@ -172,4 +193,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2、F3 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F4。
+> F0-1～F0-3、F1、F2、F3、F4 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F4.5。

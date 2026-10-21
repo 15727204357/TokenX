@@ -180,3 +180,27 @@ dd {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+
+.order-no {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.badge.order-unpaid {
+  border-color: #9a6700;
+  background: #fff8e5;
+  color: #9a6700;
+}
+
+.badge.order-paid {
+  border-color: #1a7f37;
+  background: #e8f5ec;
+  color: #1a7f37;
+}
+
+.badge.order-closed {
+  border-color: #57606a;
+  background: #eef1f4;
+  color: #57606a;
+}

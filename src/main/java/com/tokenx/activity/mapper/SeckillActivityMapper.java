@@ -37,6 +37,28 @@ public interface SeckillActivityMapper extends BaseMapper<SeckillActivity> {
       """)
   SeckillActivity selectByIdForUpdate(@Param("id") long id);
 
+  /**
+   * Reads the snapshot an order is created from, holding a shared lock on that one row.
+   *
+   * <p>{@code FOR SHARE} instead of {@code FOR UPDATE}: many buyers of the same activity read it
+   * concurrently, so they must not serialise on it — the serialisation point is the stock row. The
+   * shared lock is not decoration: it makes a concurrent withdraw ({@code FOR UPDATE} in {@code
+   * ActivityService.changeStatus}) wait until the order transaction commits, so an activity can
+   * never be taken offline between "it is published" and "the order exists".
+   *
+   * <p>{@code status} is returned rather than filtered here: the caller has to tell "no such
+   * activity" from "not open for orders", and both need the row.
+   */
+  @Select(
+      """
+      SELECT id, package_id, activity_price_cent, credit_amount_snapshot,
+             start_at, end_at, status
+      FROM seckill_activity
+      WHERE id = #{id}
+      FOR SHARE
+      """)
+  SeckillActivity selectForShare(@Param("id") long id);
+
   /** Writes the status of one row. The caller must already hold its row lock. */
   @Update("UPDATE seckill_activity SET status = #{status} WHERE id = #{id}")
   int updateStatus(@Param("id") long id, @Param("status") ActivityStatus status);

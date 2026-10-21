@@ -1,13 +1,17 @@
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useParams } from 'react-router-dom';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fetchActivity, type ActivityDetail } from '../api/activities';
+import { fetchMe } from '../api/auth';
 import { ApiError } from '../api/http';
+import { createSeckillOrder, type OrderDetail } from '../api/orders';
 import { AuthProvider } from '../auth/AuthContext';
 import { ActivityPage } from './ActivityPage';
 
 vi.mock('../api/activities');
+vi.mock('../api/auth');
+vi.mock('../api/orders');
 
 const sample: ActivityDetail = {
   id: 7,
@@ -23,21 +27,50 @@ const sample: ActivityDetail = {
   purchaseLimit: 1,
 };
 
+const sampleOrder: OrderDetail = {
+  orderNo: 'ABCDEFGHJK0000000000000001',
+  orderType: 'SECKILL',
+  activityId: 7,
+  packageId: 3,
+  packageName: '套餐A',
+  creditAmount: 1000,
+  payAmountCent: 799,
+  status: 'UNPAID',
+  expiresAt: '2026-10-22T02:15:00Z',
+  paidAt: null,
+  closedAt: null,
+  createdAt: '2026-10-22T02:00:00Z',
+};
+
+function OrderRouteMarker() {
+  const { orderNo } = useParams<{ orderNo: string }>();
+  return <p>订单页 {orderNo}</p>;
+}
+
 function renderPage(id = '7') {
   return render(
     <MemoryRouter initialEntries={[`/activities/${id}`]}>
       <AuthProvider>
         <Routes>
           <Route path="/activities/:id" element={<ActivityPage />} />
+          <Route path="/login" element={<p>登录页标记</p>} />
+          <Route path="/orders/:orderNo" element={<OrderRouteMarker />} />
         </Routes>
       </AuthProvider>
     </MemoryRouter>,
   );
 }
 
+/** Puts the provider in a logged-in state: a stored token plus a confirmed /users/me. */
+async function signInAsBuyer() {
+  localStorage.setItem('tokenx.accessToken', 'stored-token');
+  vi.mocked(fetchMe).mockResolvedValue({ id: 42, username: 'buyer', role: 'USER' });
+}
+
 describe('活动详情页', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    localStorage.clear();
   });
 
   it('展示即将开始的活动、价格、额度和 UTC 时间换算后的窗口', async () => {
@@ -45,7 +78,9 @@ describe('活动详情页', () => {
 
     renderPage();
 
-    expect(await screen.findByText('即将开始')).toBeInTheDocument();
+    // The badge and the disabled button both name the state, so the badge is selected explicitly.
+    expect(await screen.findByText('即将开始', { selector: '.badge' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '即将开始' })).toBeDisabled();
     expect(screen.getByText('¥7.99')).toBeInTheDocument();
     expect(screen.getByText('1000 Token')).toBeInTheDocument();
     expect(screen.getByText('2026-10-22 10:00:00')).toBeInTheDocument();
@@ -56,7 +91,7 @@ describe('活动详情页', () => {
     expect(fetchActivity).toHaveBeenCalledWith('7');
   });
 
-  it('展示进行中的活动', async () => {
+  it('进行中且有库存时抢购按钮可以点击', async () => {
     vi.mocked(fetchActivity).mockResolvedValue({
       ...sample,
       runtimeStatus: 'ACTIVE',
@@ -65,11 +100,21 @@ describe('活动详情页', () => {
 
     renderPage();
 
-    expect(await screen.findByText('进行中')).toBeInTheDocument();
+    const button = await screen.findByRole('button', { name: '立即抢购' });
+    expect(button).toBeEnabled();
     expect(screen.getByText('42 / 100')).toBeInTheDocument();
   });
 
-  it('展示已结束的活动', async () => {
+  it('即将开始时按钮不可点击并说明原因', async () => {
+    vi.mocked(fetchActivity).mockResolvedValue(sample);
+
+    renderPage();
+
+    const button = await screen.findByRole('button', { name: '即将开始' });
+    expect(button).toBeDisabled();
+  });
+
+  it('已结束时按钮不可点击并说明原因', async () => {
     vi.mocked(fetchActivity).mockResolvedValue({
       ...sample,
       runtimeStatus: 'ENDED',
@@ -79,11 +124,12 @@ describe('活动详情页', () => {
 
     renderPage();
 
-    expect(await screen.findByText('已结束')).toBeInTheDocument();
-    expect(screen.getByText('已售罄')).toBeInTheDocument();
+    expect(await screen.findByText('已售罄')).toBeInTheDocument();
+    const button = screen.getByRole('button', { name: '活动已结束' });
+    expect(button).toBeDisabled();
   });
 
-  it('库存为零时显示已售罄但仍展示服务端返回的进行中状态', async () => {
+  it('库存为零时显示已售罄且按钮不可点击', async () => {
     vi.mocked(fetchActivity).mockResolvedValue({
       ...sample,
       runtimeStatus: 'ACTIVE',
@@ -93,9 +139,10 @@ describe('活动详情页', () => {
 
     renderPage();
 
-    expect(await screen.findByText('已售罄')).toBeInTheDocument();
+    expect(await screen.findByText('已售罄', { selector: '.badge' })).toBeInTheDocument();
     expect(screen.getByText('进行中')).toBeInTheDocument();
     expect(screen.getByText('0 / 100')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '已售罄' })).toBeDisabled();
   });
 
   it('活动不存在时显示 404 文案而不是通用错误', async () => {
@@ -120,17 +167,82 @@ describe('活动详情页', () => {
 
     await userEvent.click(screen.getByRole('button', { name: '重试' }));
 
-    expect(await screen.findByText('即将开始')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '即将开始' })).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('本阶段不提供抢购按钮', async () => {
+  it('匿名用户点击抢购时跳转登录页并且不下单', async () => {
     vi.mocked(fetchActivity).mockResolvedValue({ ...sample, runtimeStatus: 'ACTIVE' });
 
     renderPage();
 
-    expect(await screen.findByText('进行中')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /抢购/ })).not.toBeInTheDocument();
-    expect(screen.getByText('抢购功能尚未开放，本页仅展示活动信息。')).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('button', { name: '立即抢购' }));
+
+    expect(await screen.findByText('登录页标记')).toBeInTheDocument();
+    expect(createSeckillOrder).not.toHaveBeenCalled();
+  });
+
+  it('登录用户点击抢购后带上规范 UUID 并跳转订单详情', async () => {
+    await signInAsBuyer();
+    vi.mocked(fetchActivity).mockResolvedValue({ ...sample, runtimeStatus: 'ACTIVE' });
+    vi.mocked(createSeckillOrder).mockResolvedValue(sampleOrder);
+
+    renderPage();
+
+    expect(await screen.findByText('我的账号')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: '立即抢购' }));
+
+    expect(await screen.findByText(`订单页 ${sampleOrder.orderNo}`)).toBeInTheDocument();
+
+    const [activityId, key] = vi.mocked(createSeckillOrder).mock.calls[0];
+    expect(activityId).toBe(7);
+    expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it('网络失败后重试复用同一个幂等键', async () => {
+    await signInAsBuyer();
+    vi.mocked(fetchActivity).mockResolvedValue({ ...sample, runtimeStatus: 'ACTIVE' });
+    vi.mocked(createSeckillOrder)
+      .mockRejectedValueOnce(new ApiError(0, 'NETWORK_ERROR', 'request failed'))
+      .mockResolvedValueOnce(sampleOrder);
+
+    renderPage();
+
+    await screen.findByText('我的账号');
+    await userEvent.click(screen.getByRole('button', { name: '立即抢购' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '网络异常，请重试（重试不会重复下单）',
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: '立即抢购' }));
+
+    expect(await screen.findByText(`订单页 ${sampleOrder.orderNo}`)).toBeInTheDocument();
+
+    const calls = vi.mocked(createSeckillOrder).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[1][1]).toBe(calls[0][1]);
+  });
+
+  it('业务拒绝显示明确文案，并允许用新的幂等键再次尝试', async () => {
+    await signInAsBuyer();
+    vi.mocked(fetchActivity).mockResolvedValue({ ...sample, runtimeStatus: 'ACTIVE' });
+    vi.mocked(createSeckillOrder).mockRejectedValueOnce(
+      new ApiError(409, 'ALREADY_PURCHASED', 'user already has an order for this activity'),
+    );
+
+    renderPage();
+
+    await screen.findByText('我的账号');
+    await userEvent.click(screen.getByRole('button', { name: '立即抢购' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('每人限购 1 份，你已购买过该活动');
+
+    vi.mocked(createSeckillOrder).mockResolvedValueOnce(sampleOrder);
+    await userEvent.click(screen.getByRole('button', { name: '立即抢购' }));
+    await screen.findByText(`订单页 ${sampleOrder.orderNo}`);
+
+    const calls = vi.mocked(createSeckillOrder).mock.calls;
+    expect(calls[1][1]).not.toBe(calls[0][1]);
   });
 });

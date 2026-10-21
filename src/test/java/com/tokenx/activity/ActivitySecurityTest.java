@@ -13,10 +13,11 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 /**
  * Access rules around the activity endpoints.
  *
- * <p>The interesting case is the boundary: activity detail is public, but only for {@code GET}. F4
- * will add {@code POST /activities/{id}/orders} on the very same path prefix, and it must not inherit
- * anonymous access — so the security rule is scoped to the HTTP method and this test pins that down
- * before the endpoint even exists.
+ * <p>The interesting case is the boundary: activity detail is public, but only for {@code GET}.
+ * {@code POST /activities/{id}/orders} was added on the very same path prefix in F4 and must not
+ * inherit anonymous access, so the security rule is scoped to the HTTP method and this class pins
+ * that down from both sides: an anonymous caller is rejected, and a caller with a valid token
+ * actually reaches the order handler instead of falling through.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -36,8 +37,8 @@ class ActivitySecurityTest extends AbstractActivityApiTest {
   void shouldNotOpenNonGetPathsUnderActivities() throws Exception {
     long id = publishedActivity(adminToken(), onSalePackage(100L), 100L, 5L);
 
-    // The F4 ordering path does not exist yet: an anonymous caller is rejected by authentication
-    // rather than being let through to a handler.
+    // The ordering path exists, and an anonymous caller is rejected by authentication rather than
+    // being let through to the handler that decrements stock.
     mockMvc
         .perform(post("/api/v1/activities/" + id + "/orders"))
         .andExpect(status().isUnauthorized())
@@ -50,17 +51,18 @@ class ActivitySecurityTest extends AbstractActivityApiTest {
   }
 
   @Test
-  void shouldStillRequireAuthenticationForAnAuthenticatedCallToAnUnmappedActivityPath()
-      throws Exception {
+  void shouldReachTheAuthenticatedOrderHandlerWithoutInheritingAnonymousAccess() throws Exception {
     long id = publishedActivity(adminToken(), onSalePackage(100L), 100L, 5L);
     String token = userToken();
 
-    // With credentials the request reaches MVC, where nothing is mapped yet — so it is a 404, not a
-    // silent success and not a 401. That is exactly the state F3 leaves ordering in.
+    // With credentials the request reaches the order controller, which rejects it for the missing
+    // idempotency key. A 400 here is the proof that the route is authenticated *and* mapped: an
+    // anonymous bypass would answer 401, and an open route would answer 201.
     mockMvc
-        .perform(post("/api/v1/activities/" + id + "/orders").header("Authorization", "Bearer " + token))
-        .andExpect(status().isNotFound())
-        .andExpect(jsonPath("$.code").value("NOT_FOUND"));
+        .perform(
+            post("/api/v1/activities/" + id + "/orders").header("Authorization", "Bearer " + token))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
   }
 
   @Test

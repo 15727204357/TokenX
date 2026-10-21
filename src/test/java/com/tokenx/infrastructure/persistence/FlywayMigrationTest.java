@@ -39,7 +39,7 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
             .map(info -> info.getVersion().getVersion())
             .toList();
 
-    assertThat(applied).contains("1", "2", "3", "4", "5", "5.1", "6", "7");
+    assertThat(applied).contains("1", "2", "3", "4", "5", "5.1", "6", "7", "8");
 
     assertThat(flyway.info().all())
         .as("no migration may be in a failed state")
@@ -56,9 +56,15 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
   }
 
   @Test
-  void shouldContainTheAccountCatalogueAndActivityTables() throws SQLException {
+  void shouldContainTheAccountCatalogueActivityAndOrderTables() throws SQLException {
     assertThat(existingTables())
-        .contains("app_user", "token_account", "token_package", "seckill_activity", "activity_inventory")
+        .contains(
+            "app_user",
+            "token_account",
+            "token_package",
+            "seckill_activity",
+            "activity_inventory",
+            "purchase_order")
         .doesNotContain("schema_probe");
   }
 

@@ -1,6 +1,7 @@
 package com.tokenx.activity.service;
 
 import com.tokenx.activity.dto.ActivityAdminResponse;
+import com.tokenx.activity.dto.ActivityOrderSnapshot;
 import com.tokenx.activity.dto.ActivityPublicResponse;
 import com.tokenx.activity.dto.CreateActivityRequest;
 import com.tokenx.activity.mapper.ActivityInventoryMapper;
@@ -45,6 +46,9 @@ public class ActivityService {
   static final String ACTIVITY_NOT_FOUND = "ACTIVITY_NOT_FOUND";
   static final String ACTIVITY_STATE_CONFLICT = "ACTIVITY_STATE_CONFLICT";
   static final String VALIDATION_FAILED = "VALIDATION_FAILED";
+
+  /** The activity exists but is not open for orders: draft, withdrawn, not started or ended. */
+  static final String ACTIVITY_NOT_ACTIVE = "ACTIVITY_NOT_ACTIVE";
 
   /**
    * The range MySQL can store in {@code DATETIME}. A window outside it is rejected as a bad request
@@ -168,6 +172,52 @@ public class ActivityService {
       throw activityNotFound();
     }
     return ActivityPublicResponse.from(row, now());
+  }
+
+  /**
+   * Reads the snapshot an order is created from, and answers whether the activity accepts orders
+   * right now.
+   *
+   * <p>This is the activity module answering for its own rules, so the order module never re-derives
+   * "is it published and inside the window". Two things keep it honest:
+   *
+   * <ul>
+   *   <li>The row is read with {@code FOR SHARE}, so a concurrent withdraw waits for the order
+   *       transaction to commit. Many buyers only share the row, so they still run in parallel.
+   *   <li>The window is half-open, {@code [startAt, endAt)}: at {@code now == startAt} ordering is
+   *       allowed, at {@code now == endAt} it is not. {@code now} is supplied by the caller so that
+   *       this decision, the order's creation time and its deadline all use one instant.
+   * </ul>
+   *
+   * <p>A missing activity is {@code 404 ACTIVITY_NOT_FOUND}; everything else that is not "published
+   * and open" — draft, withdrawn, not started yet, already ended — is the same {@code 409
+   * ACTIVITY_NOT_ACTIVE}, because from a buyer's point of view they are the same refusal.
+   *
+   * @param id activity being ordered
+   * @param now current instant from the injected clock, truncated to milliseconds
+   * @throws BusinessException {@code 404 ACTIVITY_NOT_FOUND}, {@code 409 ACTIVITY_NOT_ACTIVE}
+   */
+  @Transactional
+  public ActivityOrderSnapshot requireOrderable(long id, Instant now) {
+    SeckillActivity activity = activityMapper.selectForShare(id);
+    if (activity == null) {
+      throw activityNotFound();
+    }
+
+    Instant startAt = activity.getStartInstant();
+    Instant endAt = activity.getEndInstant();
+    if (activity.getStatus() != ActivityStatus.PUBLISHED
+        || now.isBefore(startAt)
+        || !now.isBefore(endAt)) {
+      throw new BusinessException(
+          HttpStatus.CONFLICT, ACTIVITY_NOT_ACTIVE, "activity is not open for orders");
+    }
+
+    return new ActivityOrderSnapshot(
+        id,
+        activity.getPackageId(),
+        activity.getActivityPriceCent(),
+        activity.getCreditAmountSnapshot());
   }
 
   private ActivityAdminResponse response(SeckillActivity activity, Instant now) {

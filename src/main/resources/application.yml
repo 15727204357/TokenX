@@ -43,6 +43,11 @@ tokenx:
       # Already-issued tokens stay valid until they expire; there is no revocation list in V1.
       ttl: ${TOKENX_JWT_TTL:1h}
 
+  order:
+    # How long a created order stays payable. Read once per creation and frozen into expires_at, so
+    # changing it only affects new orders. Validated at startup: positive and at most 24h.
+    payment-timeout: ${TOKENX_ORDER_PAYMENT_TIMEOUT:15m}
+
 server:
   port: 8080
   shutdown: graceful

@@ -158,6 +158,27 @@ public class CatalogService {
     return new PackageSnapshot(tokenPackage.getId(), tokenPackage.getCreditAmount());
   }
 
+  /**
+   * The package name an order copies into its snapshot.
+   *
+   * <p>Deliberately not {@link #requireOnSalePackageForActivity}: withdrawing a package must not
+   * invalidate an activity that is already published, so ordering must not re-check saleability.
+   * It is a plain consistent read with no lock, because the order only needs the text — the price
+   * and the credit amount come from the activity's own snapshot, and a concurrent rename may
+   * land before or after this read without changing what the buyer agreed to.
+   *
+   * <p>Packages are never deleted (they are taken off the shelf by status), so a missing row here
+   * means the data is inconsistent rather than that the caller did something wrong.
+   */
+  public String packageNameFor(long packageId) {
+    TokenPackage tokenPackage = packageMapper.selectById(packageId);
+    if (tokenPackage == null) {
+      throw new IllegalStateException(
+          "package " + packageId + " is referenced by an activity but no longer exists");
+    }
+    return tokenPackage.getName();
+  }
+
   private static BusinessException productNotFound() {
     return new BusinessException(HttpStatus.NOT_FOUND, PRODUCT_NOT_FOUND, "product not found");
   }

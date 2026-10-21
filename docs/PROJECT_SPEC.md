@@ -166,8 +166,8 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | POST | `/admin/activities` | 新增秒杀活动（管理员；固定 `DRAFT`，同事务初始化库存） | F3 |
 | PATCH | `/admin/activities/{id}/status` | 活动发布/下架（管理员；重复同一状态幂等成功） | F3 |
 | GET | `/activities/{id}` | 活动详情、运行状态和库存展示（仅 `PUBLISHED`；不存在/草稿/已下架同为 `404 ACTIVITY_NOT_FOUND`） | F3 |
-| POST | `/activities/{id}/orders` | 下单；Header `Idempotency-Key` | F4 |
-| GET | `/orders/{orderNo}` | 按不可枚举对外单号查询自己的订单 | F4 |
+| POST | `/activities/{id}/orders` | 秒杀下单。**无请求体**，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同一键重放 `200`（不再次扣库存）。失败：`400 VALIDATION_FAILED`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_NOT_ACTIVE`/`ACTIVITY_SOLD_OUT`/`ALREADY_PURCHASED`/`IDEMPOTENCY_KEY_REUSED` | F4 |
+| GET | `/orders/{orderNo}` | 按不可枚举对外单号查询**自己的**订单；不存在与他人订单同为 `404 ORDER_NOT_FOUND`，格式非法 `400 VALIDATION_FAILED` | F4 |
 | POST | `/orders` | 普通购买；Header `Idempotency-Key` | F4.5 |
 | POST | `/orders/{orderNo}/mock-pay` | 模拟支付 | F5 |
 | GET | `/wallet` | 查询余额 | F5 |
@@ -181,10 +181,19 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 
 ### 状态码约定
 
-- 200：读或幂等重试返回已有结果。
-- 201：同步下单并创建订单成功；F9 的独立异步入口返回 202 + `requestId`，不改变 V1 同步接口语义。
+- 200：读或幂等重试返回已有结果；F4 的同一 `Idempotency-Key` 重放也返回 200（表示“没有再次扣库存”）。
+- 201：本次请求真的创建了订单；F9 的独立异步入口返回 202 + `requestId`，不改变 V1 同步接口语义。
 - 400：非法参数；401：未登录；403：无权限；404：资源不存在；409：重复资格/状态冲突；429：限流；500：预期外故障。
-- 同一 `Idempotency-Key` 携带不同参数必须拒绝，不允许静默复用。
+- 同一 `Idempotency-Key` 携带不同参数必须拒绝，不允许静默复用（F4 返回 `409 IDEMPOTENCY_KEY_REUSED`，且不消耗另一活动库存）。
+
+### 7.1 下单语义（F4，MySQL 强一致基线）
+
+- **正确性只由数据库决定**：条件 `UPDATE activity_inventory … WHERE available_stock > 0` 的影响行数是唯一的售罄判据；`uk_user_request` 保证请求幂等，`uk_activity_user` 保证一人一活动一单。Redis、Kafka、消息队列与内存队列都不在 F4 的正确性路径上。
+- **事务顺序固定**：查 `(user_id, request_id)` → 活动主键 `FOR SHARE` → 校验 `PUBLISHED` 且 `now ∈ [start_at, end_at)` → 准备单号/截止时间/快照 → 条件扣库存 → `INSERT` 订单 → 提交 → 返回。
+- **唯一键冲突必须整体回滚**，然后在事务之外判定原因：同键同活动返回原订单 `200`，同键异活动 `409 IDEMPOTENCY_KEY_REUSED`，`(activity_id, user_id)` 命中 `409 ALREADY_PURCHASED`，都未命中则换订单号有限次重试。绝不允许吞掉冲突后继续提交（那会留下“扣了库存但没有订单”）。
+- **已有订单优先于活动状态**：重放判定在活动校验之前，活动结束或下架后仍能取回原订单。
+- **订单只有 `UNPAID`**：支付（F5）与超时关闭/释放库存（F6）不在本阶段；`expires_at` 由 `expires_at = created_at + tokenx.order.payment-timeout` 在创建时固化。
+- 并发集成测试测的是正确性（成功数 = 初始库存、库存不为负、失败只返回稳定业务码），**不是**压测数据。
 
 ## 8. 运行时拓扑（V1）
 

@@ -376,11 +376,13 @@ erDiagram
 
 **`order_no` 生成**：应用侧生成 26 位 Crockford Base32（时间有序 + 至少 80 位随机尾），不带业务含义、不能由相邻值推算；所有 HTTP 路径只接受 `order_no`，自增 `id` 仅供内部关联。**不引入数据库序列表**（会变成新的全局热点）。
 
-**幂等契约**：API 只接受规范 UUID 格式 `Idempotency-Key`，应用转换为 `BINARY(16)`；命中既有 `(user_id,request_id)` 时比较订单类型与目标套餐/活动，相同参数返回既有结果，不同参数返回 `409 IDEMPOTENCY_KEY_REUSED`。
+**幂等契约**：API 只接受规范 UUID 格式 `Idempotency-Key`，应用转换为 `BINARY(16)`；命中既有 `(user_id,request_id)` 时比较订单类型与目标套餐/活动，相同参数返回既有结果，不同参数返回 `409 IDEMPOTENCY_KEY_REUSED`。（F4 已实现：缺头或非规范 UUID → `400 VALIDATION_FAILED`；同键同活动 → `200` + 原订单且不再扣库存；同键异活动 → `409`，另一活动库存不动。）
 
 **外键**：`user_id`/`package_id`/`activity_id` **不建物理外键**。理由：订单是写入最热的表，物理外键会在父行上加共享锁并带来额外检查；改用"服务端校验 + 集成测试 + 对账 SQL"。父表低频写，但首版统一不建外键（一致性用应用层与对账保证），避免热路径不确定性。
 
 **读写与热点**：写入最热；读以"我的订单"（按 `user_id` 分片读）和"超时扫描"（限量批处理）为主。
+
+**F4 落地情况**：`V8` 已按上表建立全部列、5 个二级索引与 8 条 `CHECK`（`order_type`、`status`、`SECKILL⇔activity_id`、额度/金额上下限、三个终态时间组合）。F4 只写 `SECKILL` + `UNPAID`，`NORMAL` 与支付/关单留给 F4.5/F5/F6，因此 `paid_at`/`closed_at` 目前恒为 `NULL`，但约束已就位。`uk_activity_user` 是"一人一活动一单"的最终防线，**永久保留**：F6 关闭订单时只改订单状态，不删除订单行，所以关单之后依然无法重抢。`order_no` 由应用生成 26 位 Crockford Base32（10 位毫秒时间 + 16 位 80 bit 随机尾），不引入序列表。
 
 ---
 
@@ -454,6 +456,14 @@ erDiagram
 
 - 推荐顺序：**先条件扣库存，再插订单**。原因：库存是稀缺资源，先扣能把"售罄"的失败收敛在最前面，失败请求不产生订单插入（少 5 次索引写）。若先插订单再扣库存，售罄时仍要回滚一次订单插入。
 - `UNIQUE(activity_id,user_id)` 冲突发生在插入那一刻 → 事务整体回滚，库存扣减自动撤销。**不允许**吞掉 `DuplicateKeyException` 后继续提交。
+
+**F4 实现补充（与 §5.1 一致）**
+
+- 事务内第一步是 `(user_id, request_id)` 点查：命中且活动相同 → 直接返回既有订单（`200`，不再校验活动、不再扣库存），因此活动结束或下架后重放仍然可用；命中但活动不同 → `409 IDEMPOTENCY_KEY_REUSED`。
+- 活动快照用主键 `FOR SHARE` 读取（`WHERE id=?` 单行，不加状态过滤，由服务判断），与 `FOR UPDATE` 的管理写互斥、与并发的其它买家共享；`now` 只取一次（`Clock` 截断到毫秒），`created_at` 与 `expires_at` 同源。
+- 单号、`expires_at`、全部快照都在**取得库存行锁之前**备好，持锁窗口内只有 `UPDATE activity_inventory` 与 `INSERT purchase_order` 两条语句。
+- 唯一键冲突回滚后，在**事务边界之外**用独立的只读事务判定原因（事务内已不可信：旧快照看不到赢家，且该事务已注定回滚）：先 `(user_id,request_id)`、再 `(activity_id,user_id)`；两者都没有则只可能是 `uk_order_no` 撞号，换号有限次重试后如实报错。
+- 提交成功才返回；`201` 与 `200` 的区分由服务层返回的 `created` 标志决定，不依赖事务内异常。
 
 ```sql
 -- 1. 预占库存（拿行锁）
@@ -759,6 +769,9 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V10 | `V10__create_outbox_event.sql` | F8 | 事务后事件 Outbox |
 | V11 | `V11__create_processed_message.sql` | F8 | 独立下游消费幂等 |
 | V12 | `V12__create_seckill_request.sql` | F9 | 异步秒杀最终请求结果 |
+
+> 截至 F4：V1～V8 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
+> 唯一键、CHECK、`NULL activity_id` 的唯一键语义、重复 migrate 零变更）；V9 及以后属于后续任务。
 
 ### 11.2 规则
 

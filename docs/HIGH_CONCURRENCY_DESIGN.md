@@ -60,6 +60,8 @@ Client → Spring MVC → MySQL transaction
 - `UNIQUE(user_id, request_id)` 防同一用户同一请求重复建单。
 - HTTP 仅在事务提交后返回 `201`；MySQL 是唯一成功判据。
 - 这是后续所有优化的正确性与性能对照组，不能跳过。
+- **F4 已按本节实现**（`POST /api/v1/activities/{id}/orders`）：正确性路径上没有任何 Redis、Kafka、消息队列、内存队列或分布式锁；活动行 `FOR SHARE`、库存行条件 `UPDATE`、订单 `INSERT` 与唯一键冲突回滚都在同一个本地事务内。同一幂等键的重放返回 `200` 而不是 `201`，因此“重试”既不会多卖一件，也不会让调用方误以为又下了一单。
+- F4 的并发集成测试（多买家争抢小库存、同键并发、异键并发、双活动并行）验证的是**正确性**：成功数等于初始库存、`available_stock` 不为负、`reserved_stock` 等于成功数、失败只返回稳定业务码。它们不测吞吐，产生的数字不得当作 QPS/TPS 成绩引用；阶段 A 的吞吐基线属于 F10。
 
 ### 3.2 阶段 B：Redis 读缓存与准入保护（V1.5）
 
