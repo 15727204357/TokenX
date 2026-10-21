@@ -40,7 +40,8 @@ function renderPage(orderNo = sample.orderNo) {
 describe('订单详情页', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    localStorage.clear();
+    // window.localStorage, not the bare identifier: see ActivityPage.test.tsx.
+    window.localStorage.clear();
   });
 
   it('展示服务端快照：单号、套餐、额度、金额与支付截止时间', async () => {

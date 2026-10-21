@@ -61,16 +61,22 @@ function renderPage(id = '7') {
   );
 }
 
-/** Puts the provider in a logged-in state: a stored token plus a confirmed /users/me. */
+/**
+ * Puts the provider in a logged-in state: a stored token plus a confirmed /users/me.
+ *
+ * <p>The token is written through `window.localStorage`, the very same jsdom storage that
+ * `auth/storage.ts` reads, so the provider really does see the login state. A bare `localStorage`
+ * resolves to the global binding, which is Node's own stub on Node 26 — see `src/test/setup.ts`.
+ */
 async function signInAsBuyer() {
-  localStorage.setItem('tokenx.accessToken', 'stored-token');
+  window.localStorage.setItem('tokenx.accessToken', 'stored-token');
   vi.mocked(fetchMe).mockResolvedValue({ id: 42, username: 'buyer', role: 'USER' });
 }
 
 describe('活动详情页', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    localStorage.clear();
+    window.localStorage.clear();
   });
 
   it('展示即将开始的活动、价格、额度和 UTC 时间换算后的窗口', async () => {
