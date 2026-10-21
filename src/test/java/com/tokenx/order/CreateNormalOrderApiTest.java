@@ -243,7 +243,13 @@ class CreateNormalOrderApiTest extends AbstractOrderApiTest {
             new Case("non-numeric id", null, Map.of("packageId", "abc")),
             new Case("null id", null, nullMap()),
             new Case("not JSON", "not json", null),
-            new Case("empty body", "", null));
+            new Case("empty body", "", null),
+            // Sent as raw JSON with the id of the package created above, so a mapper that silently
+            // truncated the fraction would buy that real package instead of refusing the body.
+            new Case(
+                "fractional id that would truncate to a real package",
+                "{\"packageId\":" + packageId + ".5}",
+                null));
 
     for (Case testCase : cases) {
       MvcResult result =
@@ -259,7 +265,9 @@ class CreateNormalOrderApiTest extends AbstractOrderApiTest {
           .isEqualTo("VALIDATION_FAILED");
     }
 
-    assertThat(storedOrdersOfUser(buyer.id())).isEmpty();
+    assertThat(storedOrdersOfUser(buyer.id()))
+        .as("no rejected body may create an order — a fractional id must not become a real purchase")
+        .isEmpty();
   }
 
   @Test

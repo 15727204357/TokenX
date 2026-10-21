@@ -2,6 +2,16 @@ spring:
   application:
     name: tokenx
 
+  jackson:
+    deserialization:
+      # Jackson truncates a JSON float to an int/long by default (123.5 -> 123). Every integer field
+      # in this API is an identifier or an amount in minor units, so a fraction is a client mistake
+      # that must be refused, not silently rounded into a different value: `{"packageId": 123.5}`
+      # would otherwise buy package 123. Turning the coercion off makes such a body a 400.
+      # Contract: see docs/PROJECT_SPEC.md §7 (`packageId` is a positive integer);
+      # docs/DATABASE_DESIGN.md §4.2 (no float/double for money or ids).
+      accept-float-as-int: false
+
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/tokenx?sslMode=DISABLED&allowPublicKeyRetrieval=true&characterEncoding=utf8&connectionTimeZone=UTC
     username: ${TOKENX_DB_USERNAME:tokenx}
