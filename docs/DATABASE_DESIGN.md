@@ -64,7 +64,9 @@ PAID / CLOSED 为终态，V1 无退款，不可回退。
 ### 1.4 活动状态：配置态与运行态分离
 
 - `seckill_activity.status` 只表示**配置/发布状态**：`0=DRAFT`、`1=PUBLISHED`、`2=OFFLINE`。
-- "未开始 / 进行中 / 已结束"是**运行态**，由 `start_at`、`end_at` 与服务端当前时间计算，**不落库**（落库就需要定时任务改状态，且必然与真实时间漂移）。
+- 只允许两条边：`DRAFT → PUBLISHED`、`DRAFT → OFFLINE`、`PUBLISHED → OFFLINE`；`OFFLINE` 是终态，任何状态都不能回到 `DRAFT`。重复请求当前状态幂等成功，不算迁移。
+- 发布前必须重新确认套餐仍为 `ON_SALE`、`end_at > 当前服务端时间`，并用套餐当前额度刷新 `credit_amount_snapshot`；发布后这三项与总库存一起冻结。
+- "未开始 / 进行中 / 已结束"是**运行态**，由 `start_at`、`end_at` 与服务端当前时间按半开区间 `[start_at, end_at)` 计算，**不落库**（落库就需要定时任务改状态，且必然与真实时间漂移）。
 - 抢购时两种状态都要校验：`status=1` 且 `now ∈ [start_at, end_at)`。
 
 ---
@@ -256,7 +258,7 @@ erDiagram
 | `status` | `TINYINT` | NO | 0 | 0=OFF_SHELF，1=ON_SALE |
 | `created_at` / `updated_at` | `DATETIME(3)` | NO | 同上 | |
 
-**键与约束**：`PRIMARY KEY(id)`；`KEY idx_package_status (status)`（列表页 `WHERE status=1 ORDER BY id DESC`，InnoDB 二级索引自带主键，无需再写 `(status,id)`）；`CHECK` 兜底：`status IN (0,1)`、`credit_amount > 0` 且 `≤ 1000000000`、`list_price_cent > 0` 且 `≤ 100000000000`（应用层 `PackageLimits` 先校验，数据库再兜底）。`name` **不加唯一键**：同名展示套餐不是数据冲突。
+**键与约束**：`PRIMARY KEY(id)`；`KEY idx_package_status (status)`（列表页 `WHERE status=1 ORDER BY id DESC`，InnoDB 二级索引自带主键，无需再写 `(status,id)`）；`CHECK` 兜底：`status IN (0,1)`、`credit_amount > 0` 且 `≤ 1000000000`、`list_price_cent > 0` 且 `≤ 100000000000`（应用层 `AmountLimits` 先校验，数据库再兜底；该类在 F3 从 `catalog.dto.PackageLimits` 移到 `infrastructure.money.AmountLimits`，因为活动价与活动额度快照需要复用同一组上限）。`name` **不加唯一键**：同名展示套餐不是数据冲突。
 
 **前端整数契约**：`id`、`nextCursor`、`credit_amount`、`list_price_cent` 在 HTTP 上都是 JSON number，浏览器按 IEEE-754 双精度解析，因此 `credit_amount`/`list_price_cent` 必须有上述上限，且套餐自增 `id` 必须保持在 `2^53-1` 以内；未来若出现外部 ID（订单号、第三方单号），一律用字符串传输，不得以 JSON number 承载超过安全整数范围的值。
 
@@ -284,7 +286,9 @@ erDiagram
 | `status` | `TINYINT` | NO | 0 | 0=DRAFT，1=PUBLISHED，2=OFFLINE |
 | `created_at` / `updated_at` | `DATETIME(3)` | NO | 同上 | |
 
-**键与约束**：`PRIMARY KEY(id)`；`KEY idx_activity_list (status, start_at)`（首页"进行中/即将开始"：`WHERE status=1 AND end_at > ? ORDER BY start_at`，前缀 `status` 等值 + `start_at` 有序，`end_at` 作过滤残余）；`CHECK (start_at < end_at)`。
+**键与约束**：`PRIMARY KEY(id)`；`KEY idx_activity_list (status, start_at)`（首页"进行中/即将开始"：`WHERE status=1 AND end_at > ? ORDER BY start_at`，前缀 `status` 等值 + `start_at` 有序，`end_at` 作过滤残余）；`CHECK (start_at < end_at)`、`CHECK (status IN (0,1,2))`、`CHECK (activity_price_cent > 0 AND ≤ 100000000000)`、`CHECK (credit_amount_snapshot > 0 AND ≤ 1000000000)`。
+
+**写入路径（F3 已实现）**：创建时 `status` 固定 `DRAFT`、`credit_amount_snapshot` 取自套餐；发布时 `UPDATE ... SET status=1, credit_amount_snapshot=?` 用套餐当前额度刷新快照。状态迁移在事务内先 `SELECT ... FOR UPDATE` 锁该主键行再判断，并发发布/下架由此串行化；发布与创建读取套餐用 `SELECT ... FOR SHARE`，避免读到已被并发下架的旧快照。下架只写 `status`。
 
 **明确不加**：`version`（SPEC 曾提及）。理由：该行在秒杀期间**不被更新**（库存与成交不进这张表），管理员编辑是低频操作，乐观锁解决的是并不存在的争用；真出现"两人同时改活动"的需求再加。**不加** `sold_count` / `participant_count`：那会把高频写引到低频行上，且与 `activity_inventory` 的计数重复。
 
@@ -313,6 +317,8 @@ erDiagram
 | `updated_at` | `DATETIME(3)` | NO | `CURRENT_TIMESTAMP(3)` ON UPDATE | |
 
 **键与约束**：`PRIMARY KEY(activity_id)`；`CHECK (available_stock + reserved_stock <= total_stock)`。
+
+**初始化（F3）**：与活动同一事务插入，`total_stock = 请求的 totalStock`、`available_stock = totalStock`、`reserved_stock = 0`；`totalStock` 允许 `0`（表示一上线即售罄），Java 入参上限为 `Integer.MAX_VALUE`。任一步失败两张表都整体回滚，不留下孤儿行（测试用强制第二次 INSERT 失败来证明）。F3 不提供任何扣减/预占/释放库存的接口。
 
 **`sold_stock` 为什么不要**：`sold = total - available - reserved`，是纯派生量。多存一份就多一次写、多一个可能与事实不符的字段；对账时反而要判断"哪一份才对"。
 

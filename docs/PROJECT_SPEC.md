@@ -89,7 +89,7 @@
 - 每个用户每场秒杀活动**最多获得一次抢购资格**；订单关闭或超时后也不可重抢，由数据库唯一键兜底。
 - 商品套餐与活动是不同对象：活动可指向一个套餐，活动价格和库存是活动快照，不随着套餐变更回溯改变历史订单。
 - 金额全部用整数最小货币单位（示例：分），Token 额度全部用整数单位，禁止 double/float 表达余额和价格。
-- 套餐额度与标价另有服务端上限（`credit_amount ≤ 1_000_000_000`、`list_price_cent ≤ 100_000_000_000` 分），使 HTTP 响应中的数值始终落在 JavaScript 安全整数范围内；JSON number 字段的精度约定见 `DATABASE_DESIGN.md §4.2`。
+- 套餐额度与标价另有服务端上限（`credit_amount ≤ 1_000_000_000`、`list_price_cent ≤ 100_000_000_000` 分），使 HTTP 响应中的数值始终落在 JavaScript 安全整数范围内；JSON number 字段的精度约定见 `DATABASE_DESIGN.md §4.2`。活动价与活动额度快照复用同一组上限（`infrastructure.money.AmountLimits`）。
 - 一次下单对应一个活动和一个套餐；不支持购物车、组合优惠。
 - 秒杀活动必须有结束时间，时间窗为 `[start_at,end_at)`；长期常规售卖走普通购买，不用空结束时间模拟。
 - 待支付订单默认 15 分钟超时，时长配置化，订单创建时把最终截止时间快照到 `expires_at`。
@@ -116,6 +116,23 @@
 - 每笔入账对应唯一业务标识 `source_type + source_id + action`。
 - 更新余额和写入不可变流水必须在一个 DB 事务里。
 - 同一订单重复支付回调、重复业务调用不允许导致多次入账。
+
+### 5.4 活动状态（配置态与运行态分离）
+
+配置态 `status` 只有三个值：`DRAFT(0)`、`PUBLISHED(1)`、`OFFLINE(2)`，只允许两条边：
+
+```text
+DRAFT ──发布──> PUBLISHED ──下架──> OFFLINE
+  └──────────取消草稿──────────────> OFFLINE
+```
+
+- 新建活动固定为 `DRAFT`；重复请求当前状态幂等返回 `200`，不执行无意义 UPDATE。
+- `OFFLINE` 是终态，不可重新发布；任何状态都不能回到 `DRAFT`。非法迁移返回 `409 ACTIVITY_STATE_CONFLICT`。
+- 发布时重新读取套餐：套餐必须仍为 `ON_SALE`（否则 `409 PACKAGE_NOT_AVAILABLE`），且 `endAt > 当前时间`；同时用套餐当前额度刷新 `credit_amount_snapshot`。
+- 发布后活动价、额度快照、起止时间与总库存不可修改；下架只改配置态，不删除活动、不删除库存、不重置库存。
+- 运行态 `UPCOMING / ACTIVE / ENDED` **不落库**，由注入的服务端 `Clock` 按半开区间 `[startAt, endAt)` 计算；`soldOut` 单独由 `availableStock == 0` 得出，不是时间状态。
+- 时间一律以 UTC 存储（`DATETIME(3)`）和传输（ISO-8601 带 `Z`），比较前统一截断到毫秒，避免 Java 纳秒与数据库毫秒之间的漂移。
+- 每人每活动最多一单是项目固定规则（F4 用唯一键落实），活动响应返回固定 `purchaseLimit = 1`，不为此增加只能取 1 的数据库列。
 
 ## 6. 预期数据库模型（按阶段创建，不要一次全建）
 
@@ -146,8 +163,9 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | GET | `/products/{id}` | 套餐详情（仅 `ON_SALE`；不存在与已下架同为 `404 PRODUCT_NOT_FOUND`） | F2 |
 | POST | `/admin/products` | 新增套餐（管理员；默认 `OFF_SHELF`） | F2 |
 | PATCH | `/admin/products/{id}/status` | 套餐上架/下架（管理员；重复同一状态幂等成功） | F2 |
-| POST | `/admin/activities` | 创建秒杀活动 | F3 |
-| GET | `/activities/{id}` | 活动详情、状态和库存展示 | F3 |
+| POST | `/admin/activities` | 新增秒杀活动（管理员；固定 `DRAFT`，同事务初始化库存） | F3 |
+| PATCH | `/admin/activities/{id}/status` | 活动发布/下架（管理员；重复同一状态幂等成功） | F3 |
+| GET | `/activities/{id}` | 活动详情、运行状态和库存展示（仅 `PUBLISHED`；不存在/草稿/已下架同为 `404 ACTIVITY_NOT_FOUND`） | F3 |
 | POST | `/activities/{id}/orders` | 下单；Header `Idempotency-Key` | F4 |
 | GET | `/orders/{orderNo}` | 按不可枚举对外单号查询自己的订单 | F4 |
 | POST | `/orders` | 普通购买；Header `Idempotency-Key` | F4.5 |
@@ -159,7 +177,7 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 
 认证：`Authorization: Bearer <JWT>`；用户身份从认证上下文取，不允许从请求体传 `userId` 来决定交易归属。活动时间、库存、价格等由服务端决定。
 
-匿名可访问的只有：健康检查、`/auth/**`、`GET /products/**`。`/admin/**` 一律要求 `ROLE_ADMIN`（未登录 401，普通用户 403），角色只来自已验签的 JWT claim。
+匿名可访问的只有：健康检查、`/auth/**`、`GET /products/**`、`GET /activities/**`。`/admin/**` 一律要求 `ROLE_ADMIN`（未登录 401，普通用户 403），角色只来自已验签的 JWT claim。活动详情的放行规则必须绑定 HTTP Method：F4 的 `POST /activities/{id}/orders` 在同一路径前缀下，绝不能继承匿名访问。
 
 ### 状态码约定
 

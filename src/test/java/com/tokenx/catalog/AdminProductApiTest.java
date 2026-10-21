@@ -9,7 +9,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
-import com.tokenx.catalog.dto.PackageLimits;
+import com.tokenx.infrastructure.money.AmountLimits;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
 import com.tokenx.support.TestAccounts;
@@ -171,15 +171,15 @@ class AdminProductApiTest extends AbstractCatalogApiTest {
                         objectMapper.writeValueAsString(
                             createBody(
                                 name,
-                                PackageLimits.MAX_CREDIT_AMOUNT,
-                                PackageLimits.MAX_LIST_PRICE_CENT))))
+                                AmountLimits.MAX_CREDIT_AMOUNT,
+                                AmountLimits.MAX_PRICE_CENT))))
             .andExpect(status().isCreated())
-            .andExpect(jsonPath("$.creditAmount").value(PackageLimits.MAX_CREDIT_AMOUNT))
+            .andExpect(jsonPath("$.creditAmount").value(AmountLimits.MAX_CREDIT_AMOUNT))
             .andReturn();
 
     TokenPackage stored = packageMapper.selectById(trackPackage(result));
-    assertThat(stored.getListPriceCent()).isEqualTo(PackageLimits.MAX_LIST_PRICE_CENT);
-    assertThat(stored.getCreditAmount()).isEqualTo(PackageLimits.MAX_CREDIT_AMOUNT);
+    assertThat(stored.getListPriceCent()).isEqualTo(AmountLimits.MAX_PRICE_CENT);
+    assertThat(stored.getCreditAmount()).isEqualTo(AmountLimits.MAX_CREDIT_AMOUNT);
   }
 
   @Test
@@ -195,7 +195,7 @@ class AdminProductApiTest extends AbstractCatalogApiTest {
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(
                     objectMapper.writeValueAsString(
-                        createBody(creditName, PackageLimits.MAX_CREDIT_AMOUNT + 1, 100L))))
+                        createBody(creditName, AmountLimits.MAX_CREDIT_AMOUNT + 1, 100L))))
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
         .andExpect(jsonPath("$.message").value(containsString("creditAmount")));
@@ -207,7 +207,7 @@ class AdminProductApiTest extends AbstractCatalogApiTest {
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(
                     objectMapper.writeValueAsString(
-                        createBody(priceName, 100L, PackageLimits.MAX_LIST_PRICE_CENT + 1))))
+                        createBody(priceName, 100L, AmountLimits.MAX_PRICE_CENT + 1))))
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"))
         .andExpect(jsonPath("$.message").value(containsString("listPriceCent")));

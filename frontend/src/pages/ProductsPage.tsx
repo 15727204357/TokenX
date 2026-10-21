@@ -2,13 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchProducts, type Product } from '../api/products';
 import { useAuth } from '../auth/useAuth';
-
-/** Integer cents rendered as "¥12.34". Display only: the stored value stays an integer. */
-function formatPrice(cent: number): string {
-  const yuan = Math.floor(cent / 100);
-  const remainder = cent % 100;
-  return `¥${yuan}.${String(remainder).padStart(2, '0')}`;
-}
+import { formatPrice } from '../lib/format';
 
 /**
  * Public package list. Reachable without logging in; the server only ever returns on-sale packages.

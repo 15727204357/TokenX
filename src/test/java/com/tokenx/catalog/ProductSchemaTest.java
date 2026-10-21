@@ -3,7 +3,7 @@ package com.tokenx.catalog;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.tokenx.catalog.dto.PackageLimits;
+import com.tokenx.infrastructure.money.AmountLimits;
 import com.tokenx.catalog.mapper.TokenPackageMapper;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
@@ -87,12 +87,12 @@ class ProductSchemaTest extends AbstractIntegrationTest {
   @Test
   void shouldRejectAmountsAboveTheCapAtTheDatabaseLevel() {
     assertThatThrownBy(
-            () -> insertRaw("超额", PackageLimits.MAX_CREDIT_AMOUNT + 1, 100L))
+            () -> insertRaw("超额", AmountLimits.MAX_CREDIT_AMOUNT + 1, 100L))
         .as("the database must reject a credit amount above the documented cap")
         .isInstanceOf(SQLException.class);
 
     assertThatThrownBy(
-            () -> insertRaw("超价", 100L, PackageLimits.MAX_LIST_PRICE_CENT + 1))
+            () -> insertRaw("超价", 100L, AmountLimits.MAX_PRICE_CENT + 1))
         .as("the database must reject a price above the documented cap")
         .isInstanceOf(SQLException.class);
   }
@@ -100,15 +100,15 @@ class ProductSchemaTest extends AbstractIntegrationTest {
   @Test
   void shouldAcceptAmountsExactlyAtTheCap() {
     TokenPackage tokenPackage = newPackage("上限包", PackageStatus.OFF_SHELF);
-    tokenPackage.setCreditAmount(PackageLimits.MAX_CREDIT_AMOUNT);
-    tokenPackage.setListPriceCent(PackageLimits.MAX_LIST_PRICE_CENT);
+    tokenPackage.setCreditAmount(AmountLimits.MAX_CREDIT_AMOUNT);
+    tokenPackage.setListPriceCent(AmountLimits.MAX_PRICE_CENT);
 
     packageMapper.insert(tokenPackage);
     createdIds.add(tokenPackage.getId());
 
     TokenPackage loaded = packageMapper.selectById(tokenPackage.getId());
-    assertThat(loaded.getCreditAmount()).isEqualTo(PackageLimits.MAX_CREDIT_AMOUNT);
-    assertThat(loaded.getListPriceCent()).isEqualTo(PackageLimits.MAX_LIST_PRICE_CENT);
+    assertThat(loaded.getCreditAmount()).isEqualTo(AmountLimits.MAX_CREDIT_AMOUNT);
+    assertThat(loaded.getListPriceCent()).isEqualTo(AmountLimits.MAX_PRICE_CENT);
   }
 
   @Test

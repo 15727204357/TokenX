@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.tokenx.catalog.dto.CreatePackageRequest;
 import com.tokenx.catalog.dto.PackagePage;
 import com.tokenx.catalog.dto.PackageResponse;
+import com.tokenx.catalog.dto.PackageSnapshot;
 import com.tokenx.catalog.mapper.TokenPackageMapper;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
@@ -37,6 +38,9 @@ public class CatalogService {
   public static final int MAX_PAGE_SIZE = 100;
 
   static final String PRODUCT_NOT_FOUND = "PRODUCT_NOT_FOUND";
+
+  /** A package that exists but is off the shelf cannot be sold through a new activity. */
+  static final String PACKAGE_NOT_AVAILABLE = "PACKAGE_NOT_AVAILABLE";
 
   private final TokenPackageMapper packageMapper;
 
@@ -125,6 +129,33 @@ public class CatalogService {
       throw productNotFound();
     }
     return PackageResponse.from(tokenPackage);
+  }
+
+  /**
+   * Reads the package an activity is being created or published for, applying the catalogue's own
+   * rules.
+   *
+   * <p>It is deliberately not the visitor-facing detail: an activity has to tell "no such package"
+   * from "package exists but is not on sale", and both answers belong to the catalogue, so the
+   * catalogue decides them here instead of leaking two error codes into another module.
+   *
+   * <p>The row is read with {@code FOR SHARE} inside the caller's transaction, so a concurrent
+   * withdraw cannot commit between the check and the activity write.
+   *
+   * @throws BusinessException {@code 404 PRODUCT_NOT_FOUND} when the package does not exist,
+   *     {@code 409 PACKAGE_NOT_AVAILABLE} when it is not on sale
+   */
+  @Transactional
+  public PackageSnapshot requireOnSalePackageForActivity(long packageId) {
+    TokenPackage tokenPackage = packageMapper.selectByIdForShare(packageId);
+    if (tokenPackage == null) {
+      throw productNotFound();
+    }
+    if (tokenPackage.getStatus() != PackageStatus.ON_SALE) {
+      throw new BusinessException(
+          HttpStatus.CONFLICT, PACKAGE_NOT_AVAILABLE, "package is not on sale");
+    }
+    return new PackageSnapshot(tokenPackage.getId(), tokenPackage.getCreditAmount());
   }
 
   private static BusinessException productNotFound() {

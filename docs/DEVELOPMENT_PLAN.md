@@ -79,7 +79,22 @@
 
 **验收**：套餐字段校验、非管理员创建返回 403、停售套餐规则明确、测试通过。
 
-### [ ] F3 秒杀活动与库存初始化
+### [x] F3 秒杀活动与库存初始化
+
+> 完成记录（2026-10-21，分支 `feature/F3-seckill-activity`）：
+> 迁移 `V6__create_seckill_activity` / `V7__create_activity_inventory` 已应用（活动表 6 条 CHECK +
+> `idx_activity_list(status,start_at)`；库存表仅主键 + `available+reserved<=total`），无物理外键、无 `version`、
+> 无 `sold_stock`、无 Redis/Kafka/订单字段。
+> 管理端 `POST /admin/activities` 固定创建 `DRAFT` 并在同一事务写库存 `N/N/0`（额度快照取自套餐、客户端字段忽略）；
+> `PATCH /admin/activities/{id}/status` 只允许 `DRAFT→PUBLISHED`、`DRAFT→OFFLINE`、`PUBLISHED→OFFLINE`，
+> 重复同状态幂等 200，`OFFLINE` 为终态，其余 409 `ACTIVITY_STATE_CONFLICT`；发布时用 `FOR SHARE` 重读套餐
+> （须仍 `ON_SALE`，否则 409 `PACKAGE_NOT_AVAILABLE`）、要求 `endAt > now` 并刷新额度快照；
+> 状态迁移用事务内 `SELECT … FOR UPDATE` 锁单个活动主键行。
+> 公开 `GET /activities/{id}` 匿名可读，SQL 内 `WHERE a.status=1` 一次主键 JOIN 活动与库存，不存在/草稿/已下架
+> 统一 404 `ACTIVITY_NOT_FOUND`；安全规则按 `GET /api/v1/activities/**` 放行，`POST` 同前缀仍要求认证。
+> 运行态由注入的 UTC `Clock`（统一截断到毫秒）按 `[startAt,endAt)` 计算，`soldOut` 独立由 `availableStock==0` 得出。
+> `./mvnw clean verify` 128 个测试通过（新增 46 个，真实 MySQL `tokenx_test`，含并发发布/下架、强制第二次 INSERT
+> 失败的整体回滚、`FOR UPDATE` 阻塞与 Clock 边界断言）；前端 `pnpm lint` / `test`(17) / `build` / `format:check` 通过。
 
 **范围**：管理员为套餐配置开始/结束时间、活动价、库存、每人限购；活动详情页。**这一步不提供秒杀下单。**
 
@@ -157,4 +172,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F3。
+> F0-1～F0-3、F1、F2、F3 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F4。

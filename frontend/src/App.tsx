@@ -1,4 +1,5 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
+import { ActivityPage } from './pages/ActivityPage';
 import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
 import { ProductsPage } from './pages/ProductsPage';
@@ -9,6 +10,7 @@ export default function App() {
       <Route path="/" element={<HomePage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route path="/products" element={<ProductsPage />} />
+      <Route path="/activities/:id" element={<ActivityPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

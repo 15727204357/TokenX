@@ -35,6 +35,22 @@ public interface TokenPackageMapper extends BaseMapper<TokenPackage> {
       """)
   TokenPackage selectByIdForUpdate(@Param("id") long id);
 
+  /**
+   * Reads one package and holds a shared lock on its row until the current transaction ends.
+   *
+   * <p>Used when an activity is created or published: the decision "this package is on sale right
+   * now" must not come from a stale snapshot, and a concurrent withdraw has to wait for the activity
+   * transaction to finish instead of slipping in between the check and the commit.
+   */
+  @Select(
+      """
+      SELECT id, name, credit_amount, list_price_cent, status, created_at, updated_at
+      FROM token_package
+      WHERE id = #{id}
+      FOR SHARE
+      """)
+  TokenPackage selectByIdForShare(@Param("id") long id);
+
   /** Writes the status of one row. The caller must already hold its row lock. */
   @Update("UPDATE token_package SET status = #{status} WHERE id = #{id}")
   int updateStatus(@Param("id") long id, @Param("status") PackageStatus status);

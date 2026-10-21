@@ -2,10 +2,11 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2` 完成——最小可运行骨架、MySQL 迁移链路、Redis 连通性、
-> 数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，以及 Token 套餐目录
-> （管理员创建/上下架、游客游标分页列表与详情、公开列表页）。
-> 秒杀活动、订单、支付与钱包接口尚未实现。
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3` 完成——最小可运行骨架、MySQL 迁移链路、Redis 连通性、
+> 数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
+> （管理员创建/上下架、游客游标分页列表与详情、公开列表页），以及秒杀活动配置与库存初始化
+> （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态）。
+> 秒杀下单、订单、支付与钱包接口尚未实现（F4 起）。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -165,6 +166,54 @@ curl -s -X PATCH http://localhost:8080/api/v1/admin/products/1/status \
 UPDATE app_user SET role = 1 WHERE username = '<你的用户名>';
 ```
 
+## 活动接口（F3）
+
+活动把“某个套餐在某个时间窗、以某个价格、限量售卖”表达为独立对象，因此同一个套餐可以办多场活动。
+本阶段只做**配置与展示**，不提供任何下单或扣库存接口。
+
+| 方法 | 路径 | 说明 | 成功 | 主要失败 |
+|---|---|---|---|---|
+| POST | `/admin/activities` | 创建活动（管理员），请求体只接受 `packageId`/`activityPriceCent`/`totalStock`/`startAt`/`endAt` | `201`，配置态固定 `DRAFT`，同事务写入库存 `N/N/0` | `400 VALIDATION_FAILED`、`401`、`403`、`404 PRODUCT_NOT_FOUND`、`409 PACKAGE_NOT_AVAILABLE` |
+| PATCH | `/admin/activities/{id}/status` | 发布/下架（管理员），`{"status":"PUBLISHED"\|"OFFLINE"}` | `200`，重复同一状态也返回 `200` | `400`、`401`、`403`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_STATE_CONFLICT` |
+| GET | `/activities/{id}` | 公开活动详情，**只返回 `PUBLISHED`** | `200` | `400 VALIDATION_FAILED`、`404 ACTIVITY_NOT_FOUND`（不存在/草稿/已下架完全一致） |
+
+```bash
+# 管理员：创建 → 发布（$ADMIN_TOKEN 见上一节的本地管理员说明）
+curl -s -X POST http://localhost:8080/api/v1/admin/activities \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"packageId":1,"activityPriceCent":799,"totalStock":100,
+       "startAt":"2026-10-22T02:00:00Z","endAt":"2026-10-22T03:00:00Z"}'
+
+curl -s -X PATCH http://localhost:8080/api/v1/admin/activities/1/status \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"status":"PUBLISHED"}'
+
+# 游客：活动详情（无需 Token）
+curl -s http://localhost:8080/api/v1/activities/1
+```
+
+要点：
+
+- **两个状态必须分开理解**：`status` 是配置态（`DRAFT`/`PUBLISHED`/`OFFLINE`），
+  `runtimeStatus` 是运行态（`UPCOMING`/`ACTIVE`/`ENDED`），后者由服务端 `Clock` 按 `[startAt, endAt)`
+  实时计算，**不落库**；`soldOut` 另由 `availableStock == 0` 得出，不是时间状态。
+- 状态机只有 `DRAFT→PUBLISHED`、`DRAFT→OFFLINE`、`PUBLISHED→OFFLINE` 三条边；`OFFLINE` 是终态，
+  不能重新发布，也不能回到 `DRAFT`。重复请求当前状态幂等 `200`，其余非法迁移 `409`。
+- 创建时 `endAt` 必须在未来，`startAt` 允许在过去（立即开始型）；`startAt < endAt` 为硬约束。
+- 到账额度由服务端从套餐读取并快照，客户端传 `creditAmountSnapshot`/`status`/`availableStock`/
+  `reservedStock`/`purchaseLimit`/`userId` 一律忽略。发布时会再次读取套餐：套餐必须仍 `ON_SALE`，
+  且用套餐**当前**额度刷新快照。
+- 发布后活动价、额度快照、起止时间、总库存都没有修改入口；下架只改配置态，不删除活动、不删除库存、
+  不重置库存。
+- 同一活动的并发发布/下架由数据库单行锁（`SELECT … FOR UPDATE`）串行化，只锁该主键行。
+- 金额与额度上限沿用 F2 的 JavaScript 安全整数契约，常量集中在
+  `com.tokenx.infrastructure.money.AmountLimits`（`activityPriceCent ≤ 100_000_000_000` 分、
+  `creditAmountSnapshot ≤ 1_000_000_000`），数据库 `CHECK` 兜底。
+- 公开详情用一次主键 JOIN 读取活动与库存，且 `WHERE a.status = 1` 写在 SQL 里；`reservedStock`、
+  数字状态码与 `createdAt`/`updatedAt` 都不出现在公开响应中。
+- 每人每活动最多一单是项目固定规则（F4 用唯一键落实），响应里固定返回 `purchaseLimit = 1`，
+  不为此增加一个只能取 1 的数据库列。
+
 ## 前端（`frontend/`）
 
 ```bash
@@ -176,18 +225,24 @@ pnpm test
 pnpm build
 ```
 
-页面：登录 / 注册并登录、当前用户、以及公开的套餐列表 `/products`（未登录可访问，展示名称、Token
-额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页）。Token 存在浏览器
-`localStorage`，由统一的 HTTP 拦截器附加到请求头。
+页面：登录 / 注册并登录、当前用户、公开的套餐列表 `/products`（未登录可访问，展示名称、Token
+额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页），以及公开的活动详情
+`/activities/:id`（展示活动价、Token 额度、起止时间、可用库存与 `UPCOMING`/`ACTIVE`/`ENDED`；
+库存为 0 时显示“已售罄”；本阶段没有抢购按钮）。Token 存在浏览器 `localStorage`，由统一的 HTTP
+拦截器附加到请求头。
+
+活动页只展示服务端返回的 `runtimeStatus`，不在浏览器里比较时间来判断活动是否开始——否则前端与
+后端会在边界时刻给出不同答案。时间按 `Asia/Shanghai`（UTC+8）格式化，仅用于展示。
 
 ## 数据库迁移
 
 - 迁移脚本位于 `src/main/resources/db/migration/`，命名 `V<版本>__<说明>.sql`。
 - 应用启动时由 Flyway 自动执行；**禁止**手工改已发布的迁移文件，也禁止用 ORM 自动建表覆盖。
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
-  `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）。
+  `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
+  `activity_inventory`（F3）。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V5.1 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V7 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥
@@ -207,19 +262,23 @@ src/main/java/com/tokenx/
 │   ├── controller/  service/  mapper/  model/  dto/
 ├── catalog/                        F2 套餐模块：创建、上下架、公共列表与详情
 │   ├── controller/  service/  mapper/  model/  dto/
-└── infrastructure/                 通用基础设施（安全、异常转换、外部适配）
+├── activity/                       F3 活动模块：创建、发布/下架、公开详情
+│   ├── controller/  service/  mapper/  model/  dto/
+└── infrastructure/                 通用基础设施（安全、异常转换、时间源、外部适配）
     ├── web/                        健康检查、统一错误、requestId
     ├── security/                   Spring Security 配置、JWT 签发与本地验签
+    ├── money/                      金额与额度上限常量（跨模块共享的唯一数值契约）
+    ├── time/                       唯一的 Clock Bean（生产为 UTC）
     └── error/                      业务异常类型
 src/main/resources/
 ├── application.yml                 默认配置（无密码、无密钥）
 ├── db/migration/                   Flyway 版本化迁移
-src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog 为真实 MySQL 集成测试）
+src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog/activity 为真实 MySQL 集成测试）
 frontend/                           React 19 + TS + Vite 前端
 docs/                               需求、工程规范、实施计划、Git 工作流、版本锁定
 ```
 
-业务模块（`activity`、`order`、`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
+业务模块（`order`、`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
 
 ## 项目文档
 

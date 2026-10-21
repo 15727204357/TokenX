@@ -63,6 +63,11 @@ public class SecurityConfig {
                     // Visitors may browse the catalogue; only writes need an authenticated admin.
                     .requestMatchers(HttpMethod.GET, "/api/v1/products/**")
                     .permitAll()
+                    // Activity details are public for the same reason — but only GET. Scoping the
+                    // rule to the method is what keeps a future POST /activities/{id}/orders
+                    // authenticated instead of silently open.
+                    .requestMatchers(HttpMethod.GET, "/api/v1/activities/**")
+                    .permitAll()
                     .requestMatchers("/api/v1/admin/**")
                     .hasRole("ADMIN")
                     .requestMatchers("/actuator/health", "/actuator/info")
