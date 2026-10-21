@@ -442,6 +442,11 @@ erDiagram
 其它写入者），因此流水时间与 `paid_at` 是同一时刻。`balance_after` 在同一事务内读回真实余额后
 写入，不做应用侧加法。
 
+**读侧归属约束**：流水只存 `biz_id`，对外单号靠 join `purchase_order` 取得。因为没有外键，读取时
+必须把归属一并作为连接条件：`ON o.id = l.biz_id AND o.user_id = l.user_id`。若某条流水的 `biz_id`
+错误指向他人订单，该条流水仍出现在本人列表中（其 `delta`/`balance_after` 是对账证据，不能隐藏），
+但 `order_no` 返回 `null`，不会把他人订单号带出来。这不是外键的替代品，而是读侧的纵深防御。
+
 ---
 
 ## 5. 关键 SQL 与事务边界

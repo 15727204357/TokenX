@@ -234,6 +234,9 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - **流水分页按 `id` 降序游标**（`cursor=<ledgerId>`、默认 20、上限 100、`limit+1` 判断是否有下一页），
   与套餐分页同一风格；条目只暴露 `entryId`、`bizType=ORDER`、`orderNo`、`effectType=CREDIT`、
   `delta`、`balanceAfter`、`createdAt`，不暴露内部订单 `id`、`user_id` 或他人流水。
+- **`orderNo` 的关联必须校验归属**：流水只存 `biz_id`（订单内部 `id`）且无物理外键，因此取单号的
+  join 条件同时包含 `o.id = l.biz_id` 与 `o.user_id = l.user_id`。`biz_id` 若指向他人订单，该条流水
+  **仍返回**（隐藏它会连带隐藏余额差异），但 `orderNo` 为 `null`，绝不返回他人的订单号。
 
 ## 8. 运行时拓扑（V1）
 

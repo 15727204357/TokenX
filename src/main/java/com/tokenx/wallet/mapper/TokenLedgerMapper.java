@@ -31,6 +31,14 @@ public interface TokenLedgerMapper extends BaseMapper<TokenLedger> {
    * whose order is missing means corruption — and hiding that posting would also hide a balance
    * difference, which is worse than showing one entry without a number.
    *
+   * <p>The join also requires the order to belong to the same person as the posting ({@code
+   * o.user_id = l.user_id}). Without that predicate a single corrupted {@code biz_id} would answer
+   * one user's wallet page with another user's order number — there is no foreign key to prevent the
+   * bad row in the first place, so the read is where the two identities have to agree. A mismatch is
+   * not filtered out: the posting stays in the page, still carrying its own amounts and timestamp,
+   * but {@code order_no} comes back {@code null}, which is exactly what a missing order produces.
+   * Suppressing the row instead would hide a balance difference along with the leak.
+   *
    * @param userId authenticated owner; the only account whose rows can be returned
    * @param cursor last {@code id} of the previous page, {@code null} for the first page
    * @param limit page size plus one, already bounded by the service
@@ -48,6 +56,7 @@ public interface TokenLedgerMapper extends BaseMapper<TokenLedger> {
         FROM token_ledger l
         LEFT JOIN purchase_order o
                ON o.id = l.biz_id
+              AND o.user_id = l.user_id
        WHERE l.user_id = #{userId}
          AND l.biz_type = 1
       <if test="cursor != null">
