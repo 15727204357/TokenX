@@ -181,11 +181,14 @@
 > 复用 `PurchaseOrder`/`OrderResponse`/`Clock`/`TokenAccount` 及其 Mapper（**不移动** F1 的账户模型，
 > 避免无谓重构），只在既有 Mapper 上补 `markPaid`、`selectByOrderNoAndUserForShare`、
 > `settleReserved`、`creditBalance` 四条明确 SQL；无新增接口/Strategy/Factory/单例。
-> `./mvnw clean verify` **229 个测试通过**（新增 33 个：V9 结构 8、钱包 API 8、支付 API 10、
-> 并发 3、回滚 4；真实 MySQL `tokenx_test`）。覆盖：普通/秒杀首付、顺序重复、同单 4 线程并发、
+> `./mvnw clean verify` **232 个测试通过**（F5 新增 33 个：V9 结构 8、钱包 API 8、支付 API 10、
+> 并发 3、回滚 4；复审修复另增 3 个流水归属测试；真实 MySQL `tokenx_test`）。覆盖：普通/秒杀首付、
+> 顺序重复、同单 4 线程并发、
 > 同用户两单并发、两买家的预占同时结转、不同用户不串账、404 一致、CLOSED 零副作用、
 > `expiresAt-1ms` 可付/精确时刻 409、伪造体无效、库存结转与账户缺失/更新失败/流水 INSERT 失败
 > 各自整笔回滚、余额=SUM(delta)、每张已付订单恰一条流水、`available+reserved+paid=total`。
+> 复审修复提交 `dc3a33a` 将流水关联订单的条件收紧为 `o.id = l.biz_id AND o.user_id = l.user_id`；
+> 异常跨用户 `biz_id` 的流水仍保留用于对账，但不再暴露他人 `orderNo`，并覆盖正常关联与跨页隔离。
 > 前端 `pnpm lint` / `test`(**50**) / `build` / `format:check` 通过（订单页模拟支付 + 新钱包页 `/wallet`）。
 
 **范围**：创建 `token_ledger`；复用 F1 已建立的 `token_account`；订单 `UNPAID → PAID`；同一个本地 DB 事务内结转秒杀预占库存、更新账户和写入流水；React 展示模拟支付按钮和余额。
