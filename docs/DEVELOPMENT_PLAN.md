@@ -160,7 +160,33 @@
 
 **验收**：普通套餐可重复购买；同一 `Idempotency-Key` 不重复建单且参数变化被拒绝；停售套餐不能下单；普通与秒杀订单使用同一查询和后续状态机；测试通过。
 
-### [ ] F5 模拟支付与钱包入账
+### [x] F5 模拟支付与钱包入账
+
+> 完成记录（2026-10-21，分支 `feature/F5-mock-payment`）：
+> 迁移 `V9__create_token_ledger` 已应用：8 列、`uk_ledger_biz(biz_type,biz_id,effect_type)`、
+> `idx_ledger_user(user_id)`、3 条 CHECK（业务类型/效果类型枚举、`delta` 与 `effect_type` 的符号一致、
+> 0 变动被拒绝），无物理外键；V1–V8/V5.1 零改动，schema 版本 = V9。
+> `POST /api/v1/orders/{orderNo}/mock-pay`（无请求体，身份只取自 JWT）：事务内顺序固定为
+> ① 条件 `UPDATE purchase_order … WHERE order_no AND user_id AND status=0 AND expires_at>now`
+> （影响 1 行即赢得支付并持有订单行锁）→ ② `SELECT … FOR SHARE` **当前读**取最新已提交状态与可信快照
+> → ③ 仅 `SECKILL` 执行 `reserved_stock-1`（`available_stock` 不动）→ ④ `available_balance+credit_amount`
+> → ⑤ 同事务读回余额 → ⑥ `INSERT token_ledger`（`biz_type=1`、`biz_id=订单内部 id`、`effect_type=1`、
+> `created_at` 与 `paid_at` 同一 `Clock` 读数）。任一步影响 0 行都视为不变量破坏，整笔回滚。
+> 语义：`PAID` 重放 `200` 且不重复结转/入账；`CLOSED` 与 `UNPAID` 已过期同为 `409
+> ORDER_STATE_CONFLICT`（过期订单不入账、不释放库存，关单留给 F6）；不存在与他人订单同为 `404
+> ORDER_NOT_FOUND`；非法单号 `400 VALIDATION_FAILED`；未登录 `401`。账户缺失禁止懒创建。
+> `GET /api/v1/wallet` 返回 `availableBalance`/`updatedAt`；`GET /api/v1/wallet/ledger` 按 `id` 降序
+> 游标分页（默认 20、上限 100、`limit+1` 判 `hasMore`、JOIN 订单表只暴露 `orderNo`），仅返回本人流水。
+> 代码结构：新增 `payment/{controller,service}` 与 `wallet/{controller,service,mapper,model,dto}`；
+> 复用 `PurchaseOrder`/`OrderResponse`/`Clock`/`TokenAccount` 及其 Mapper（**不移动** F1 的账户模型，
+> 避免无谓重构），只在既有 Mapper 上补 `markPaid`、`selectByOrderNoAndUserForShare`、
+> `settleReserved`、`creditBalance` 四条明确 SQL；无新增接口/Strategy/Factory/单例。
+> `./mvnw clean verify` **229 个测试通过**（新增 33 个：V9 结构 8、钱包 API 8、支付 API 10、
+> 并发 3、回滚 4；真实 MySQL `tokenx_test`）。覆盖：普通/秒杀首付、顺序重复、同单 4 线程并发、
+> 同用户两单并发、两买家的预占同时结转、不同用户不串账、404 一致、CLOSED 零副作用、
+> `expiresAt-1ms` 可付/精确时刻 409、伪造体无效、库存结转与账户缺失/更新失败/流水 INSERT 失败
+> 各自整笔回滚、余额=SUM(delta)、每张已付订单恰一条流水、`available+reserved+paid=total`。
+> 前端 `pnpm lint` / `test`(**50**) / `build` / `format:check` 通过（订单页模拟支付 + 新钱包页 `/wallet`）。
 
 **范围**：创建 `token_ledger`；复用 F1 已建立的 `token_account`；订单 `UNPAID → PAID`；同一个本地 DB 事务内结转秒杀预占库存、更新账户和写入流水；React 展示模拟支付按钮和余额。
 
@@ -216,4 +242,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2、F3、F4、F4.5 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F5。
+> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F6。

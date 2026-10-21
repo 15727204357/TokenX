@@ -9,10 +9,11 @@ import org.apache.ibatis.annotations.Update;
 /**
  * Access to {@code activity_inventory}.
  *
- * <p>F3 inserts the initial row. F4 adds exactly one write: reserving one unit. It is a conditional
- * {@code UPDATE} rather than a read-then-write because "is there stock left" and "take one" must
- * happen as one atomic statement under concurrent buyers — a plain {@code SELECT} followed by an
- * {@code UPDATE} would let two requests both read the last unit.
+ * <p>F3 inserts the initial row. F4 adds exactly one write: reserving one unit. F5 adds its mirror
+ * image: settling a reservation when the order behind it is paid. Both are conditional updates
+ * rather than read-then-write, because "is the unit there" and "take it / give it up" must happen as
+ * one atomic statement under concurrent writers — a plain {@code SELECT} followed by an
+ * {@code UPDATE} would let two requests act on the same unit.
  */
 @Mapper
 public interface ActivityInventoryMapper extends BaseMapper<ActivityInventory> {
@@ -37,4 +38,25 @@ public interface ActivityInventoryMapper extends BaseMapper<ActivityInventory> {
          AND available_stock > 0
       """)
   int reserveOne(@Param("activityId") long activityId);
+
+  /**
+   * Settles one reservation: the unit leaves {@code reserved_stock} and becomes sold.
+   *
+   * <p>{@code available_stock} is deliberately not touched. A paid unit was never available again,
+   * and putting it back would make the activity look like it had stock to sell. Sold stock stays
+   * derived ({@code total - available - reserved}), so nothing else needs updating.
+   *
+   * <p>The affected-row count is the invariant check: {@code 1} means one reservation was settled,
+   * {@code 0} means the activity had no reservation to settle while an unpaid order claimed to hold
+   * one. The caller must treat that as corruption and roll the whole payment back — a credit
+   * without a settled reservation would break {@code available + reserved + paid = total}.
+   */
+  @Update(
+      """
+      UPDATE activity_inventory
+         SET reserved_stock = reserved_stock - 1
+       WHERE activity_id = #{activityId}
+         AND reserved_stock > 0
+      """)
+  int settleReserved(@Param("activityId") long activityId);
 }

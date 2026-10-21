@@ -2,13 +2,15 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5` 完成——最小可运行骨架、MySQL 迁移链路、
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5` 完成——最小可运行骨架、MySQL 迁移链路、
 > Redis 连通性、数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
 > （管理员创建/上下架、游客游标分页列表与详情、公开列表页），秒杀活动配置与库存初始化
 > （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），**同步秒杀下单**
-> （MySQL 条件扣库存 + 唯一键一人一单 + 幂等键重放、订单详情页），以及**普通购买下单**
-> （按套餐标价直接下单，不碰活动库存、无一人一单限制，与秒杀共用订单表、查询与后续状态机）。
-> 支付与钱包接口尚未实现（F5 起），订单超时关闭在 F6。
+> （MySQL 条件扣库存 + 唯一键一人一单 + 幂等键重放、订单详情页），**普通购买下单**
+> （按套餐标价直接下单，不碰活动库存、无一人一单限制，与秒杀共用订单表、查询与后续状态机），
+> 以及**模拟支付与钱包**（同一事务内订单转 `PAID` + 秒杀预占结转 + 余额入账 + 不可变流水，
+> 重复/并发支付只入账一次，余额与流水分页查询，订单页支付按钮与钱包页）。
+> 订单超时关闭与库存释放在 F6，Redis/Kafka 优化在 F7 及以后。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -304,6 +306,59 @@ curl -s http://localhost:8080/api/v1/orders/<orderNo> -H "Authorization: Bearer 
 - **F4.5 不新增迁移**：`V8__create_purchase_order.sql` 里的 `order_type`、可空 `activity_id` 与
   `ck_order_activity` 已经为 `NORMAL` 准备好，Flyway 仍停在 V8。
 
+## 模拟支付与钱包（F5）
+
+**这是本地模拟支付**：没有第三方渠道、没有回调、不建 `payment_record`。一次支付就是一次 MySQL
+本地事务，"成功"意味着这笔提交真的落库。
+
+| 方法 | 路径 | 说明 | 成功 | 主要失败 |
+|---|---|---|---|---|
+| POST | `/orders/{orderNo}/mock-pay` | 模拟支付（需登录）。**无请求体**，身份只取自 JWT | `200` + 更新后的订单（`status=PAID`、`paidAt` 非空）；已支付重放同样 `200` | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ORDER_NOT_FOUND`、`409 ORDER_STATE_CONFLICT` |
+| GET | `/wallet` | 查询**自己的**余额（需登录） | `200` `{"availableBalance":1000,"updatedAt":"..."}` | `401 UNAUTHORIZED` |
+| GET | `/wallet/ledger` | 查询**自己的**流水分页（需登录） | `200` `{"items":[...],"nextCursor":null,"hasMore":false}` | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED` |
+
+```bash
+# 支付（无请求体：金额、额度、支付时间全部来自订单快照）
+curl -s -X POST "http://localhost:8080/api/v1/orders/<orderNo>/mock-pay" \
+  -H "Authorization: Bearer $TOKEN"
+# 200 -> {"orderNo":"...","status":"PAID","paidAt":"2026-10-21T12:00:00Z",...}
+
+# 钱包余额与流水（默认 20 条，翻页带 cursor=<上一页最后一条 entryId>）
+curl -s http://localhost:8080/api/v1/wallet -H "Authorization: Bearer $TOKEN"
+curl -s "http://localhost:8080/api/v1/wallet/ledger?limit=20" -H "Authorization: Bearer $TOKEN"
+```
+
+要点：
+
+- **一次支付 = 一个事务，四步固定顺序**：① 条件 `UPDATE purchase_order … WHERE order_no=?
+  AND user_id=? AND status=0 AND expires_at>?`（**状态闸门**，影响 1 行即赢得支付并持有订单行锁）
+  → ② `SELECT … FOR SHARE` **当前读**取最新已提交状态与可信快照 → ③ 仅 `SECKILL` 执行
+  `reserved_stock-1` → ④ `available_balance + credit_amount` → ⑤ 同事务读回余额 →
+  ⑥ 写入一条 `CREDIT` 流水。任一步失败，订单状态、库存、余额、流水**全部回滚**。
+- **为什么失败后要用当前读**：REPEATABLE READ 下普通 `SELECT` 读事务快照，可能早于刚提交的赢家，
+  会把已支付订单判成"仍待支付"从而尝试第二次入账。`FOR SHARE` 是当前读，要么读到已提交的
+  `PAID`（→ 幂等 `200`），要么在赢家的行锁上等待后再读到 `PAID`。
+- **重复支付与并发支付只产生一次效果**：`status=0` 写在 `UPDATE` 条件里，任意多个并发者中只有
+  一个影响 1 行；其余等待后按幂等 `200` 返回，**不出现 500**，也不会二次结转库存或二次加余额。
+  `uk_ledger_biz(biz_type,biz_id,effect_type)` 是第二道防线，不替代状态闸门：若它真的命中，说明
+  订单状态与流水已矛盾，此时整笔回滚并报错，绝不把冲突当作成功。
+- **普通订单与秒杀订单的唯一差别是库存**：`SECKILL` 只把 `reserved_stock` 减 1，`available_stock`
+  不动（已售量仍由 `total-available-reserved` 派生）；`NORMAL` 完全不读也不写 `activity_inventory`。
+- **过期与关单**：`UNPAID` 且 `expires_at <= now` 返回 `409 ORDER_STATE_CONFLICT`，**不入账、不释放
+  库存**；把订单迁移为 `CLOSED` 并归还预占是 F6 的事。已 `CLOSED` 同样 `409` 且零副作用。
+- **客户端说了不算**：`credit_amount`、`pay_amount_cent` 来自下单时的快照，`userId` 来自已验签 JWT；
+  请求体即使带 `userId`/`creditAmount`/`status`/`paidAt` 也不会被采纳（该接口根本没有请求体参数）。
+- **账户不懒创建**：注册时与用户同事务建账户（Q8）。账户缺失属于不变量破坏，整笔回滚并报错，
+  绝不在支付路径上补建。
+- **余额与流水可对账**：`token_account.available_balance` 必须等于 `SUM(token_ledger.delta)`；
+  每张已支付订单恰好一条 `ORDER/CREDIT` 流水；秒杀活动满足
+  `available + reserved + 已支付订单数 = total_stock`。这三条都有集成测试断言。
+- **流水分页**：按 `id` 降序游标（`cursor` 为上一页最后一条 `entryId`），`limit` 默认 20、上限 100，
+  用 `limit+1` 判断是否还有下一页，不执行 `COUNT(*)`；条目只暴露 `entryId`、`bizType=ORDER`、
+  `orderNo`、`effectType=CREDIT`、`delta`、`balanceAfter`、`createdAt`——内部订单 `id`、`user_id`
+  与他人流水都不会出现。
+- F5 的并发/回滚测试同样只验证**正确性**（只入账一次、只结转一次、失败四张表原样），不是压测数据。
+
 ## 前端（`frontend/`）
 
 ```bash
@@ -318,9 +373,17 @@ pnpm build
 页面：登录 / 注册并登录、当前用户、公开的套餐列表 `/products`（未登录可访问，展示名称、Token
 额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页，每个在售套餐带“立即购买”入口）、
 公开的活动详情 `/activities/:id`（展示活动价、Token 额度、起止时间、可用库存与
-`UPCOMING`/`ACTIVE`/`ENDED`；库存为 0 时显示“已售罄”），以及订单详情 `/orders/:orderNo`
-（展示服务端快照：单号、套餐、额度、应付金额与支付截止）。Token 存在浏览器 `localStorage`，
-由统一的 HTTP 拦截器附加到请求头。
+`UPCOMING`/`ACTIVE`/`ENDED`；库存为 0 时显示“已售罄”）、订单详情 `/orders/:orderNo`
+（展示服务端快照：单号、套餐、额度、应付金额、支付截止与支付时间），以及钱包 `/wallet`
+（可用额度与流水分页）。Token 存在浏览器 `localStorage`，由统一的 HTTP 拦截器附加到请求头。
+
+订单页只在状态为 `UNPAID` 时显示“模拟支付”，请求进行中按钮禁用（`aria-busy`）以防重复点击；
+支付成功后**用服务端返回的订单**替换本地状态，因此立即变成“已支付”并出现支付时间。`PAID` 与
+`CLOSED` 没有支付按钮。`404`（订单不存在或属于他人）、`409`（已过期/已关闭）与网络失败各给出一句
+明确提示；页面不显示倒计时，也不拿浏览器时间判断是否到期——那是服务端的判断。
+
+钱包页需要登录，未登录直接跳 `/login`；余额与流水都来自服务端，页面不做本地累加。流水按服务端
+`nextCursor` 续页，失败时可重试；“加载更多”失败只影响追加，不会清掉已经显示的记录。
 
 活动页的抢购按钮只在服务端返回 `ACTIVE` 且未售罄时可点，其余状态按钮禁用并写明原因（即将开始 /
 活动已结束 / 已售罄）；未登录点击跳转登录页，登录后点击才真正下单。每次下单用浏览器原生
@@ -341,11 +404,14 @@ pnpm build
 - 应用启动时由 Flyway 自动执行；**禁止**手工改已发布的迁移文件，也禁止用 ORM 自动建表覆盖。
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
   `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
-  `activity_inventory`（F3）、`V8` `purchase_order`（F4）。
+  `activity_inventory`（F3）、`V8` `purchase_order`（F4）、`V9` `token_ledger`（F5，当前版本）。
 - **F4.5 没有新增迁移**：普通购买复用 `V8` 已建好的 `order_type` / 可空 `activity_id` /
-  `ck_order_activity`，Flyway 版本仍是 V8。
+  `ck_order_activity`。
+- **V9 只建 `token_ledger`**：`uk_ledger_biz(biz_type,biz_id,effect_type)` 是重复入账的第二道防线，
+  `idx_ledger_user(user_id)` 服务按用户降序游标翻页；3 条 CHECK 固定业务/效果枚举并要求
+  `delta` 的符号与 `effect_type` 一致（0 变动不接受）。V1–V8/V5.1 一个字都没改。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V8 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V9 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥
@@ -372,6 +438,10 @@ src/main/java/com/tokenx/
 │   ├── controller/  service/  mapper/  model/  dto/
 ├── order/                          F4/F4.5 订单模块：秒杀下单、普通购买、幂等键、订单查询
 │   ├── controller/  service/  mapper/  model/  dto/  support/  config/
+├── payment/                        F5 模拟支付：状态闸门、库存结转、入账事务
+│   ├── controller/  service/
+├── wallet/                         F5 钱包：余额查询、不可变流水与游标分页
+│   ├── controller/  service/  mapper/  model/  dto/
 └── infrastructure/                 通用基础设施（安全、异常转换、时间源、外部适配）
     ├── web/                        健康检查、统一错误、requestId
     ├── security/                   Spring Security 配置、JWT 签发与本地验签
@@ -381,12 +451,14 @@ src/main/java/com/tokenx/
 src/main/resources/
 ├── application.yml                 默认配置（无密码、无密钥）
 ├── db/migration/                   Flyway 版本化迁移
-src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog/activity/order 为真实 MySQL 集成测试）
+src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog/activity/order/payment/wallet 为真实 MySQL 集成测试）
 frontend/                           React 19 + TS + Vite 前端
 docs/                               需求、工程规范、实施计划、Git 工作流、版本锁定
 ```
 
-业务模块（`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
+账户模型 `auth/model/TokenAccount` 与其 Mapper 仍留在 `auth`（F1 与用户同事务创建）：钱包与支付
+复用它读写余额，不重复建第二份账户模型；`token_ledger` 自己的实体与 Mapper 属于 `wallet`。
+业务模块（`messaging` 等）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
 
 ## 项目文档
 

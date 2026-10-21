@@ -433,6 +433,15 @@ erDiagram
 
 **过度设计检查**：不存请求报文、不存操作人 IP、不做"失败尝试"日志（那是应用日志的事）。
 
+**F5 落地情况（2026-10-21）**：`V9__create_token_ledger.sql` 按上表建立全部列、主键、
+`uk_ledger_biz(biz_type,biz_id,effect_type)`、`idx_ledger_user(user_id)` 与 3 条 `CHECK`：
+`biz_type IN (1)`（新增业务类型需要新迁移，词表不会悄悄变大）、`effect_type IN (1,2)`、
+`(effect_type=1 AND delta>0) OR (effect_type=2 AND delta<0)`（方向与符号必须一致，0 变动不被接受）。
+无物理外键：流水与订单一样，一致性由服务、测试与对账保证。应用只 `INSERT`，不提供任何
+`UPDATE`/`DELETE` 路径；`created_at` 由应用用支付时的同一个 `Clock` 显式写入（列默认值保留给
+其它写入者），因此流水时间与 `paid_at` 是同一时刻。`balance_after` 在同一事务内读回真实余额后
+写入，不做应用侧加法。
+
 ---
 
 ## 5. 关键 SQL 与事务边界
@@ -486,39 +495,83 @@ VALUES (?,?,?,?,?,1,?,?,?,0,?);
 
 `expires_at` 默认使用配置化 15 分钟，在建单时固化；之后修改配置只影响新订单。事务中只使用注入的服务端 `Clock` 所得同一时刻，客户端时间不参与判断。
 
-### 5.2 模拟支付（4 次写，同一事务）
+### 5.2 模拟支付（F5 实现，同一事务 4 次写）
 
 ```sql
--- 0. 按对外单号和当前用户读取内部 id、订单类型与可信快照；查不到统一返回 404
-SELECT id, order_type, activity_id, credit_amount, status
-  FROM purchase_order
- WHERE order_no = ? AND user_id = ?;
-
--- 1. 订单状态单向迁移，拿订单行锁；再次带 user_id 防止调用层遗漏归属校验
+-- 0. 事务外：orderNo 必须是 26 位 Crockford Base32，否则 400 VALIDATION_FAILED（不查库）
+-- 1. 状态闸门 + 订单行锁：一句条件 UPDATE 同时完成“判断 + 修改”
 UPDATE purchase_order
-   SET status = 1, paid_at = ?, updated_at = ?
- WHERE id = ? AND user_id = ? AND status = 0;
--- 影响行数 0 → 已支付或已关闭，直接按现状返回（幂等）
+   SET status = 1,
+       paid_at = ?,
+       updated_at = ?
+ WHERE order_no = ?
+   AND user_id = ?
+   AND status = 0
+   AND expires_at > ?;            -- 只读一次 Clock，截断到毫秒
+-- 影响 1 行 = 本次赢得支付资格并持有订单行排他锁；影响 0 行进入第 2 步
 
--- 2. 活动订单结转库存（普通订单跳过）
+-- 2. 当前读：拿最新已提交状态，同时取得可信快照（order_type/activity_id/credit_amount/id）
+SELECT id, order_type, activity_id, credit_amount, status, expires_at, paid_at
+  FROM purchase_order
+ WHERE order_no = ? AND user_id = ?
+ FOR SHARE;
+-- 无行 → 404 ORDER_NOT_FOUND（不存在与他人订单一致）
+-- PAID → 幂等 200，本次不写任何表
+-- CLOSED → 409 ORDER_STATE_CONFLICT
+-- UNPAID 且 expires_at <= now → 409 ORDER_STATE_CONFLICT（F6 才真正关单并释放库存）
+
+-- 3. 仅 SECKILL：结转预占库存（available_stock 不动）；影响行数必须为 1
 UPDATE activity_inventory
    SET reserved_stock = reserved_stock - 1
- WHERE activity_id = ? AND reserved_stock > 0;
+ WHERE activity_id = ?
+   AND reserved_stock > 0;
 
--- 3. 加额度
+-- 4. 原子加余额；影响行数必须为 1（账户缺失 = 不变量破坏，禁止懒创建）
 UPDATE token_account
    SET available_balance = available_balance + ?
  WHERE user_id = ?;
 
--- 4. 读回余额 + 写流水（唯一键防重复入账）
+-- 5. 同一事务、同一连接读回余额（读己之写）
 SELECT available_balance FROM token_account WHERE user_id = ?;
-INSERT INTO token_ledger(user_id, biz_type, biz_id, effect_type, delta, balance_after)
-VALUES (?, 1, ?, 1, ?, ?);
+
+-- 6. 写不可变流水：biz_type=1, biz_id=订单内部 id, effect_type=1, delta=credit_amount
+INSERT INTO token_ledger(user_id, biz_type, biz_id, effect_type, delta, balance_after, created_at)
+VALUES (?, 1, ?, 1, ?, ?, ?);
 ```
 
-**为什么先判订单状态而不是先判流水唯一键**：重复支付的第一道闸是 `status=0` 条件更新，失败即返回，不会走到钱包。账本唯一键是**第二道防线**，用于兜住"代码路径绕过状态检查"或未来异步重复消费的情况。
+**为什么闸门是条件 UPDATE 而不是“先查后改”**：支付是每毫秒都有竞争的状态迁移。`status = 0`
+写在 `UPDATE` 里，数据库在一条语句内完成“判断 + 修改”并取得行锁，任意多个并发支付者中只有
+一个能看到影响行数 1；先 `SELECT` 再 `UPDATE` 会让两个请求都读到 `UNPAID`，然后在
+`expires_at` 或状态上做出不同判断。
 
-**注意**：第 3 步与第 4 步之间存在读己之写（同一事务、同一连接），能读到刚加后的余额。
+**影响 0 行之后必须用当前读**：REPEATABLE READ 下普通 `SELECT` 读的是事务快照，可能早于刚提交
+的赢家，从而把一张已支付的订单判成“仍待支付”，进而触发第二次入账。第 2 步的 `FOR SHARE` 是
+当前读：要么读到已提交的 `PAID`（→ 幂等 200），要么在赢家的行锁上等待，等其提交后再读到
+`PAID`。并发支付同一订单时其他请求因此不会返回 500，也不会重复入账。
+
+**状态判定的优先级**：`PAID` 先于截止时间判断——一张按时支付、之后才超过截止时间的订单依然是
+已支付，重放不能变成 409。
+
+**发号顺序**：第 3 步的 `SECKILL` 判断来自订单快照，普通订单**完全不读也不写**
+`activity_inventory`；因此普通订单支付没有库存行参与，也就不会与秒杀竞争。
+
+**为什么先判订单状态而不是先判流水唯一键**：重复支付的第一道闸是 `status = 0` 条件更新，失败即
+返回，不会走到钱包。`uk_ledger_biz (biz_type,biz_id,effect_type)` 是**第二道防线**，用于兜住
+“代码绕过状态检查直接入账”的情况；它不能替代条件更新——若它真的命中，说明订单状态与流水已经
+矛盾，此时整笔事务回滚并报错，而不是把冲突当作成功。
+
+**每一步的影响行数都是不变量断言**：库存结转 0 行、账户更新 0 行都表示 F3/F1 建立的不变量已被
+破坏（例如待支付订单没有对应的预占、用户没有账户行），必须让整笔事务回滚：订单状态、库存、
+余额、流水要么全部生效，要么全部不存在。账户**不懒创建**（Q8：注册时与用户同事务建立）。
+
+**过期语义**：`expires_at <= now` 的 `UNPAID` 订单拒绝支付且不入账、不释放库存。把订单迁移为
+`CLOSED` 并归还预占是 F6 的职责，F5 不抢这一步。
+
+**时间**：`paid_at`、`updated_at`、流水的 `created_at` 来自同一份注入的 UTC `Clock`（截断到
+毫秒），因此流水的证据时间与被证明的支付时刻一致；客户端时间不参与任何判断。
+
+**余额上限**：`available_balance` 是 `BIGINT UNSIGNED`，加法溢出会让数据库报错并使事务回滚，
+不会回绕成一个很小的余额。
 
 ### 5.3 超时关闭（2 次写）
 
@@ -773,9 +826,10 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V11 | `V11__create_processed_message.sql` | F8 | 独立下游消费幂等 |
 | V12 | `V12__create_seckill_request.sql` | F9 | 异步秒杀最终请求结果 |
 
-> 截至 F4.5：V1～V8 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
-> 唯一键、CHECK、`NULL activity_id` 的唯一键语义、重复 migrate 零变更）；V9 及以后属于后续任务。
-> F4.5 只加代码不加列，Flyway 仍停在 V8。
+> 截至 F5：V1～V9 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
+> 唯一键、CHECK、`NULL activity_id` 的唯一键语义、流水的方向/符号 CHECK、重复 migrate 零变更，
+> 当前 schema 版本 = V9）；V10 及以后属于后续任务。
+> F4.5 只加代码不加列，未新增迁移；F5 新增的 V9 只建 `token_ledger`，不改动 V1–V8/V5.1。
 
 ### 11.2 规则
 

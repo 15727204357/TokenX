@@ -59,6 +59,22 @@ export async function fetchOrder(orderNo: string): Promise<OrderDetail> {
 }
 
 /**
+ * Confirms the simulated payment of one order.
+ *
+ * <p>No body: the price, the credits and the deadline are already snapshots on the order, and who is
+ * paying comes from the access token. A browser that sent an amount would only be telling the server
+ * what it would prefer to pay, so the request has nothing to say.
+ *
+ * <p>The server answers `200` both when it just paid the order and when the order was already paid,
+ * and the returned order is the authority on the new state — the page must render this response
+ * rather than assume the payment worked or guess that the order is now `PAID`.
+ */
+export async function mockPayOrder(orderNo: string): Promise<OrderDetail> {
+  const { data } = await http.post<OrderDetail>(`/orders/${orderNo}/mock-pay`);
+  return data;
+}
+
+/**
  * Creates one normal purchase: an on-sale package bought at its list price.
  *
  * <p>Only `packageId` is sent. The package name, the credits, the price and the payment deadline are

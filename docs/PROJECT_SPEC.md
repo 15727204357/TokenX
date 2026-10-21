@@ -113,7 +113,7 @@
 ### 5.3 钱包语义
 
 - 每个用户一个账户，余额不能为负。
-- 每笔入账对应唯一业务标识 `source_type + source_id + action`。
+- 每笔入账对应唯一业务标识 `(biz_type, biz_id, effect_type)`，由 `uk_ledger_biz` 兜底。
 - 更新余额和写入不可变流水必须在一个 DB 事务里。
 - 同一订单重复支付回调、重复业务调用不允许导致多次入账。
 
@@ -144,7 +144,7 @@ DRAFT ──发布──> PUBLISHED ──下架──> OFFLINE
 | `activity_inventory` | `activity_id` PK, `total_stock`, `available_stock`, `reserved_stock`；已售量由前三者计算 | 同步秒杀 |
 | `purchase_order` | 内部 `id`, 对外 `order_no` UNIQUE, `(user_id,request_id)` UNIQUE, `(activity_id,user_id)` UNIQUE，价格/额度快照与 `expires_at` | 同步秒杀与普通购买 |
 | `token_account` | `user_id` PK, `available_balance`, `updated_at`；与用户同事务创建 | 用户与登录（F1 建表，F5 开放钱包能力） |
-| `token_ledger` | `id`, `user_id`, `biz_type`, `biz_id`, `effect_type`, `delta`; UNIQUE `(biz_type,biz_id,effect_type)` | 钱包 |
+| `token_ledger` | `id`, `user_id`, `biz_type`, `biz_id`, `effect_type`, `delta`, `balance_after`; UNIQUE `(biz_type,biz_id,effect_type)` | 钱包（F5） |
 | `outbox_event` / `processed_message` | 事务后事件可靠发布与消费幂等 | F8（V1.5） |
 | `seckill_request` | 异步准入的最终结果、`request_id` 与 `order_id` | F9（V1.5） |
 
@@ -169,9 +169,9 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | POST | `/activities/{id}/orders` | 秒杀下单。**无请求体**，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同一键重放 `200`（不再次扣库存）。失败：`400 VALIDATION_FAILED`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_NOT_ACTIVE`/`ACTIVITY_SOLD_OUT`/`ALREADY_PURCHASED`/`IDEMPOTENCY_KEY_REUSED` | F4 |
 | GET | `/orders/{orderNo}` | 按不可枚举对外单号查询**自己的**订单；不存在与他人订单同为 `404 ORDER_NOT_FOUND`，格式非法 `400 VALIDATION_FAILED` | F4 |
 | POST | `/orders` | 普通购买。请求体只有 `{"packageId":<正整数>}`，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同键同套餐重放 `200`。失败：`400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 PRODUCT_NOT_FOUND`、`409 PACKAGE_NOT_AVAILABLE`/`IDEMPOTENCY_KEY_REUSED` | F4.5 |
-| POST | `/orders/{orderNo}/mock-pay` | 模拟支付 | F5 |
-| GET | `/wallet` | 查询余额 | F5 |
-| GET | `/wallet/ledger` | 流水分页 | F5 |
+| POST | `/orders/{orderNo}/mock-pay` | 模拟支付（需登录，**无请求体**）。首次成功与已支付重放都返回 `200` 与更新后的订单 | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ORDER_NOT_FOUND`、`409 ORDER_STATE_CONFLICT` | F5 |
+| GET | `/wallet` | 查询**自己的**余额（需登录） | `200` `{"availableBalance","updatedAt"}`；`401 UNAUTHORIZED` | F5 |
+| GET | `/wallet/ledger` | 查询**自己的**流水分页（需登录；`cursor` + `limit`，默认 20、上限 100） | `200` `{"items","nextCursor","hasMore"}`；`400 VALIDATION_FAILED`、`401 UNAUTHORIZED` | F5 |
 | POST | `/activities/{id}/order-requests` | V1.5 异步秒杀受理，成功返回 202 | F9 |
 | GET | `/order-requests/{requestId}` | 查询异步请求最终结果 | F9 |
 
@@ -211,6 +211,29 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - **已有订单优先于套餐状态**：重放判定在套餐校验之前，因此订单创建后套餐下架，仍可用同一幂等键取回。
 - **与管理员下架协调**：下单对套餐行持 `FOR SHARE`，上下架走同一主键的 `FOR UPDATE`，不会基于过期状态建单。
 - 普通购买同样只有 `UNPAID`：支付在 F5、超时关闭在 F6，均不区分渠道，但关闭时只有秒杀订单需要释放预留库存。
+
+### 7.3 模拟支付与钱包语义（F5）
+
+- **一次支付 = 一个本地事务**：订单 `UNPAID → PAID`、秒杀预占库存结转、账户加额度、写入不可变流水
+  全部在同一事务内，任一步失败四者同时回滚。**不建** `payment_record`、不调外部渠道、不引入退款。
+- **状态闸门是条件 UPDATE**：`WHERE order_no=? AND user_id=? AND status=0 AND expires_at > now`。
+  影响 1 行即本次赢得支付并持有订单行锁；影响 0 行后必须用**当前读**（`FOR SHARE`）分类，
+  因为 REPEATABLE READ 下的普通 `SELECT` 可能读到早于赢家提交的快照。
+- **重复与并发只产生一次效果**：已 `PAID` 重放返回 `200`，不再结转库存、不再加余额、不再写流水；
+  并发支付同一订单时只有一个请求影响 1 行，其余等待后按幂等重放处理，**不返回 500**。
+  `uk_ledger_biz` 是第二道防线，不替代状态闸门。
+- **库存差异**：`SECKILL` 订单只把 `reserved_stock` 减 1，`available_stock` 不动（已售量仍由
+  `total - available - reserved` 派生）；`NORMAL` 订单**完全跳过**库存读写。
+- **过期语义**：`UNPAID` 且 `expiresAt <= now` 返回 `409 ORDER_STATE_CONFLICT`，不入账、不释放库存；
+  把它迁移为 `CLOSED` 并归还预占属于 F6。已 `CLOSED` 同样 `409` 且无任何副作用。
+- **可信数据只来自订单快照与 JWT**：请求体（即使带金额、额度、`userId`、状态、支付时间）不参与任何
+  计算；支付金额与到账额度取自下单时写入的 `credit_amount`。
+- **账户不懒创建**：账户缺失属于不变量破坏，整笔回滚并报错；支付路径不补建账户。
+- **钱包查询只描述调用者**：两个接口都不接受用户标识参数，身份只来自已验签 JWT；余额缺失同样是
+  不变量破坏（注册已与用户同事务建账户），不返回伪造的 0。
+- **流水分页按 `id` 降序游标**（`cursor=<ledgerId>`、默认 20、上限 100、`limit+1` 判断是否有下一页），
+  与套餐分页同一风格；条目只暴露 `entryId`、`bizType=ORDER`、`orderNo`、`effectType=CREDIT`、
+  `delta`、`balanceAfter`、`createdAt`，不暴露内部订单 `id`、`user_id` 或他人流水。
 
 ## 8. 运行时拓扑（V1）
 

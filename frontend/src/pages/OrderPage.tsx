@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/http';
-import { fetchOrder, type OrderDetail, type OrderStatus } from '../api/orders';
+import { fetchOrder, mockPayOrder, type OrderDetail, type OrderStatus } from '../api/orders';
 import { useAuth } from '../auth/useAuth';
 import { formatInstant, formatPrice } from '../lib/format';
 
@@ -12,12 +12,44 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
 };
 
 /**
- * Order detail.
+ * Why a payment was refused, in words the buyer can act on.
+ *
+ * <p>`ORDER_NOT_FOUND` covers "no such order" and "someone else's order" with one message, because
+ * the server deliberately makes those two cases indistinguishable.
+ */
+function paymentMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    switch (error.code) {
+      case 'ORDER_NOT_FOUND':
+        return '订单不存在或无权查看';
+      case 'ORDER_STATE_CONFLICT':
+        return '订单已过期或已关闭，无法支付';
+      case 'UNAUTHORIZED':
+        return '登录状态已失效，请重新登录';
+      case 'VALIDATION_FAILED':
+        return '订单号无效，请返回订单列表重试';
+      case 'NETWORK_ERROR':
+        return '网络异常，支付结果未确认，请重试（重复支付不会重复入账）';
+      default:
+        return '支付失败，请稍后重试';
+    }
+  }
+  return '支付失败，请稍后重试';
+}
+
+/**
+ * Order detail, with the simulated payment action.
  *
  * <p>Everything on this page comes from the order the server stored: the amounts are the snapshots
  * taken at creation time, the status is the server's state, and the deadline is the instant the
- * server fixed. Nothing is recomputed from the browser clock — a countdown would be a second,
- * disagreeing source of truth, and this stage has no payment yet.
+ * server fixed. Nothing is recomputed from the browser clock — in particular the page never decides
+ * on its own that an order has expired, because the server is the only authority on that and would
+ * answer `409`.
+ *
+ * <p>The payment button exists only for `UNPAID`. While a request is in flight it is disabled, so a
+ * double click cannot become two calls; and when the server answers, the returned order — not an
+ * assumption — becomes the state this page renders. `PAID` and `CLOSED` therefore never offer a
+ * button, without any extra rule.
  *
  * <p>A missing order and another buyer's order are the same `404` by design, so there is no
  * "permission denied" branch to leak the difference.
@@ -30,6 +62,9 @@ export function OrderPage() {
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [paying, setPaying] = useState(false);
+  const [payError, setPayError] = useState<string | null>(null);
+  const [paidNotice, setPaidNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!orderNo) {
@@ -71,10 +106,34 @@ export function OrderPage() {
     };
   }, [orderNo, attempt]);
 
+  async function pay() {
+    if (!order || paying) {
+      // A second click while one request is in flight is not a second payment.
+      return;
+    }
+
+    setPaying(true);
+    setPayError(null);
+    setPaidNotice(null);
+
+    try {
+      const updated = await mockPayOrder(order.orderNo);
+      setOrder(updated);
+      if (updated.status === 'PAID') {
+        setPaidNotice('支付成功，Token 已入账');
+      }
+    } catch (cause) {
+      setPayError(paymentMessage(cause));
+    } finally {
+      setPaying(false);
+    }
+  }
+
   return (
     <main className="card wide">
       <nav className="topnav">
         <Link to="/products">套餐</Link>
+        <Link to="/wallet">钱包</Link>
         <Link to={user ? '/' : '/login'}>{user ? '我的账号' : '登录'}</Link>
       </nav>
 
@@ -139,7 +198,29 @@ export function OrderPage() {
             ) : null}
           </dl>
 
-          <p className="hint">支付功能将在后续版本开放，本页仅展示服务端记录的订单信息。</p>
+          {order.status === 'UNPAID' ? (
+            <div className="actions">
+              <button type="button" onClick={() => void pay()} disabled={paying} aria-busy={paying}>
+                {paying ? '正在支付…' : '模拟支付'}
+              </button>
+            </div>
+          ) : null}
+
+          {payError ? (
+            <p className="error" role="alert">
+              {payError}
+            </p>
+          ) : null}
+
+          {paidNotice ? (
+            <p className="notice">
+              {paidNotice}，<Link to="/wallet">查看钱包与流水</Link>
+            </p>
+          ) : null}
+
+          <p className="hint">
+            这是本地模拟支付，不会发生真实扣款。支付结果与到账额度都以服务端返回为准。
+          </p>
         </>
       ) : null}
     </main>

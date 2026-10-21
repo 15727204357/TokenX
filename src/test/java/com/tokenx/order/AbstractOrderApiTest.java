@@ -12,11 +12,16 @@ import com.tokenx.activity.model.ActivityInventory;
 import com.tokenx.auth.mapper.AppUserMapper;
 import com.tokenx.auth.mapper.TokenAccountMapper;
 import com.tokenx.auth.model.AppUser;
+import com.tokenx.auth.model.TokenAccount;
 import com.tokenx.catalog.mapper.TokenPackageMapper;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
 import com.tokenx.order.mapper.PurchaseOrderMapper;
 import com.tokenx.order.model.PurchaseOrder;
+import com.tokenx.wallet.mapper.TokenLedgerMapper;
+import com.tokenx.wallet.model.LedgerBizType;
+import com.tokenx.wallet.model.LedgerEffectType;
+import com.tokenx.wallet.model.TokenLedger;
 import com.tokenx.support.AbstractIntegrationTest;
 import com.tokenx.support.TestAccounts;
 import com.tokenx.support.TestAdmins;
@@ -42,18 +47,23 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Shared setup for the order tests: real MySQL, a controllable clock, genuine logins, and cleanup
- * that removes only the rows a test created.
+ * Shared setup for the order, payment and wallet tests: real MySQL, a controllable clock, genuine
+ * logins, and cleanup that removes only the rows a test created.
  *
  * <p>The default activity window is already <em>open</em> around {@link #BASE}, because most tests
  * are about what happens once an activity accepts orders. Window edges are tested by moving the
  * clock or by building an activity with an explicit window, never by sleeping.
  *
  * <p>No foreign keys exist by design, so cleanup deletes the child rows explicitly, in the reverse
- * order of creation.
+ * order of creation. Ledger rows go first: they are the only rows that point at an order by value
+ * rather than by a constraint, so leaving them behind would let a later test see someone else's
+ * posting.
+ *
+ * <p>Public so the payment and wallet test packages can use the same fixtures instead of growing a
+ * second, subtly different copy of "create a buyer, publish an activity, place an order".
  */
 @Import(TestClockConfig.class)
-abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
+public abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
 
   protected static final Instant BASE = TestClockConfig.BASE;
 
@@ -73,6 +83,7 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   @Autowired protected SeckillActivityMapper activityMapper;
   @Autowired protected ActivityInventoryMapper inventoryMapper;
   @Autowired protected PurchaseOrderMapper orderMapper;
+  @Autowired protected TokenLedgerMapper ledgerMapper;
   @Autowired protected PasswordEncoder passwordEncoder;
 
   private final List<Long> activityIds = new ArrayList<>();
@@ -90,6 +101,11 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
 
   @AfterEach
   void deleteRowsCreatedByThisTest() {
+    // Wallet postings first: an order must not be deleted while a posting still names its id.
+    for (Long buyerId : buyerIds) {
+      ledgerMapper.delete(Wrappers.<TokenLedger>lambdaQuery().eq(TokenLedger::getUserId, buyerId));
+    }
+
     for (Long activityId : activityIds) {
       orderMapper.delete(
           Wrappers.<PurchaseOrder>lambdaQuery().eq(PurchaseOrder::getActivityId, activityId));
@@ -294,6 +310,33 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
     return UUID.randomUUID().toString();
   }
 
+  // --- payment and wallet requests -------------------------------------------------------------
+
+  /** Confirms a mock payment. No body: the server reads the price and the credits from the order. */
+  protected ResultActions mockPay(String token, String orderNo) throws Exception {
+    return mockMvc.perform(
+        post("/api/v1/orders/" + orderNo + "/mock-pay").header("Authorization", "Bearer " + token));
+  }
+
+  /** The same call with a body a client might try to tamper with; none of it may be honoured. */
+  protected ResultActions mockPay(String token, String orderNo, Map<String, Object> body)
+      throws Exception {
+    return mockMvc.perform(
+        post("/api/v1/orders/" + orderNo + "/mock-pay")
+            .header("Authorization", "Bearer " + token)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(objectMapper.writeValueAsString(body)));
+  }
+
+  protected ResultActions getWallet(String token) throws Exception {
+    return mockMvc.perform(get("/api/v1/wallet").header("Authorization", "Bearer " + token));
+  }
+
+  protected ResultActions getLedger(String token, String query) throws Exception {
+    return mockMvc.perform(
+        get("/api/v1/wallet/ledger" + query).header("Authorization", "Bearer " + token));
+  }
+
   // --- assertions helpers ---------------------------------------------------------------------
 
   protected JsonNode json(MvcResult result) throws Exception {
@@ -337,6 +380,38 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   /** The package as the database now holds it, for asserting that ordering changed nothing. */
   protected TokenPackage storedPackage(long packageId) {
     return packageMapper.selectById(packageId);
+  }
+
+  /** The account row as the database holds it; {@code null} only if the invariant is broken. */
+  protected TokenAccount storedAccount(long userId) {
+    return accountMapper.selectById(userId);
+  }
+
+  protected long storedBalance(long userId) {
+    TokenAccount account = storedAccount(userId);
+    return account == null ? -1L : account.getAvailableBalance();
+  }
+
+  /** Every posting one user owns, newest first, exactly as the ledger stores them. */
+  protected List<TokenLedger> storedLedgerOf(long userId) {
+    return ledgerMapper.selectList(
+        Wrappers.<TokenLedger>lambdaQuery()
+            .eq(TokenLedger::getUserId, userId)
+            .orderByDesc(TokenLedger::getId));
+  }
+
+  /** The single posting an order produced, or {@code null} if payment posted nothing. */
+  protected TokenLedger storedLedgerOfOrder(long orderId) {
+    return ledgerMapper.selectOne(
+        Wrappers.<TokenLedger>lambdaQuery()
+            .eq(TokenLedger::getBizType, LedgerBizType.ORDER)
+            .eq(TokenLedger::getBizId, orderId)
+            .eq(TokenLedger::getEffectType, LedgerEffectType.CREDIT));
+  }
+
+  /** The order row behind a number owned by this user, for asserting the stored state. */
+  protected PurchaseOrder storedOrder(String orderNo, long userId) {
+    return orderMapper.selectByOrderNoAndUser(orderNo, userId);
   }
 
   protected String body(MvcResult result) throws Exception {

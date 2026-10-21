@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { http } from './http';
-import { createSeckillOrder, fetchOrder, type OrderDetail } from './orders';
+import { createSeckillOrder, fetchOrder, mockPayOrder, type OrderDetail } from './orders';
 
 vi.mock('./http', () => ({
   http: { get: vi.fn(), post: vi.fn() },
@@ -49,5 +49,19 @@ describe('订单接口', () => {
 
     expect(fetched).toEqual(order);
     expect(http.get).toHaveBeenCalledWith(`/orders/${order.orderNo}`);
+  });
+
+  it('模拟支付只按单号调用，不发送任何金额或用户字段', async () => {
+    const paid: OrderDetail = { ...order, status: 'PAID', paidAt: '2026-10-22T02:05:00Z' };
+    vi.mocked(http.post).mockResolvedValue({ data: paid });
+
+    const result = await mockPayOrder(order.orderNo);
+
+    expect(result).toEqual(paid);
+    expect(http.post).toHaveBeenCalledTimes(1);
+
+    const [url, body] = vi.mocked(http.post).mock.calls[0];
+    expect(url).toBe(`/orders/${order.orderNo}/mock-pay`);
+    expect(body).toBeUndefined();
   });
 });
