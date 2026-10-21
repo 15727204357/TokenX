@@ -132,21 +132,25 @@ public class CatalogService {
   }
 
   /**
-   * Reads the package an activity is being created or published for, applying the catalogue's own
-   * rules.
+   * Reads a package that is about to be sold, applying the catalogue's own rules, and returns the
+   * server-side snapshot of it.
    *
-   * <p>It is deliberately not the visitor-facing detail: an activity has to tell "no such package"
-   * from "package exists but is not on sale", and both answers belong to the catalogue, so the
-   * catalogue decides them here instead of leaking two error codes into another module.
+   * <p>Two callers have the same question and must get the same answer: an activity is being created
+   * or published for this package, or a buyer is purchasing it directly. It is deliberately not the
+   * visitor-facing detail, because both have to tell "no such package" from "package exists but is
+   * not on sale", and both answers belong to the catalogue — so the catalogue decides them here
+   * instead of leaking two error codes into another module.
    *
    * <p>The row is read with {@code FOR SHARE} inside the caller's transaction, so a concurrent
-   * withdraw cannot commit between the check and the activity write.
+   * withdraw (which takes {@code FOR UPDATE} on the same primary key) cannot commit between the check
+   * and the write that depends on it: the waiting transaction reads the committed status instead of
+   * the snapshot it started with. Many buyers share the lock, so they still run in parallel.
    *
    * @throws BusinessException {@code 404 PRODUCT_NOT_FOUND} when the package does not exist,
    *     {@code 409 PACKAGE_NOT_AVAILABLE} when it is not on sale
    */
   @Transactional
-  public PackageSnapshot requireOnSalePackageForActivity(long packageId) {
+  public PackageSnapshot requireOnSalePackage(long packageId) {
     TokenPackage tokenPackage = packageMapper.selectByIdForShare(packageId);
     if (tokenPackage == null) {
       throw productNotFound();
@@ -155,13 +159,17 @@ public class CatalogService {
       throw new BusinessException(
           HttpStatus.CONFLICT, PACKAGE_NOT_AVAILABLE, "package is not on sale");
     }
-    return new PackageSnapshot(tokenPackage.getId(), tokenPackage.getCreditAmount());
+    return new PackageSnapshot(
+        tokenPackage.getId(),
+        tokenPackage.getName(),
+        tokenPackage.getCreditAmount(),
+        tokenPackage.getListPriceCent());
   }
 
   /**
    * The package name an order copies into its snapshot.
    *
-   * <p>Deliberately not {@link #requireOnSalePackageForActivity}: withdrawing a package must not
+   * <p>Deliberately not {@link #requireOnSalePackage}: withdrawing a package must not
    * invalidate an activity that is already published, so ordering must not re-check saleability.
    * It is a plain consistent read with no lock, because the order only needs the text — the price
    * and the credit amount come from the activity's own snapshot, and a concurrent rename may

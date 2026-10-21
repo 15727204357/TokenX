@@ -131,7 +131,30 @@
 
 **明确禁止**：此时不得使用 Redis Lua、Kafka 或消息队列作为订单正确性的必要依赖。先记录基础接口吞吐与功能正确性，不需要进行正式高压性能调优。
 
-### [ ] F4.5 普通购买下单
+### [x] F4.5 普通购买下单
+
+> 完成记录（2026-10-21，分支 `feature/F4.5-normal-order`）：
+> 新增 `POST /api/v1/orders`（请求体只有 `{"packageId":<正整数>}`，Header 必须带规范 UUID 的
+> `Idempotency-Key`）与独立事务入口 `NormalOrderService`；`SeckillOrderService` 仍是秒杀的唯一入口。
+> 普通订单写 `order_type=NORMAL`、`activity_id=NULL`、`status=UNPAID`，套餐名/额度/标价取自事务内
+> `token_package` 的 `FOR SHARE` 读，`expires_at = created_at + tokenx.order.payment-timeout`（服务端 UTC
+> `Clock`，统一毫秒），单号继续由 `OrderNoGenerator` 生成。事务顺序：查 `(user_id,request_id)`
+> → 一次 Clock 读取 → 套餐 `FOR SHARE` 且必须 `ON_SALE` → `INSERT purchase_order` → 提交；**不读不写**
+> `activity_inventory`，无一人一单限制（`uk_activity_user` 因 NULL 不参与唯一比较）。
+> 幂等比较改为**订单类型 + 目标**：同键同套餐 `200` 重放；同键换套餐、或在 NORMAL/SECKILL 之间复用
+> `409 IDEMPOTENCY_KEY_REUSED`；重放判定在套餐校验之前，套餐下架后仍可取回原订单。唯一键冲突整体回滚后
+> 在事务之外判定，`order_no` 撞号有限次重试。其余错误：`404 PRODUCT_NOT_FOUND`、`409
+> PACKAGE_NOT_AVAILABLE`、`400 VALIDATION_FAILED`（含无法解析的请求体）、`401 UNAUTHORIZED`。
+> 共享收敛（不新增接口/Strategy/Factory/单例）：`OrderDraft`（快照装配 + 单号 + 截止时间）、
+> `OrderReplays`（幂等查询与 409）、`OrderQueryService`（两渠道共用 `GET /orders/{orderNo}`）；
+> `PackageSnapshot` 扩充为名称+额度+标价，`CatalogService.requireOnSalePackage` 同时服务活动与购买。
+> **零 DDL**：无新迁移，Flyway 仍停在 V8。前端套餐列表新增“立即购买”（未登录跳登录页、成功跳订单详情、
+> 请求中禁用按钮、幂等键按套餐保存：同套餐网络失败重试复用、明确业务拒绝后换新、切套餐用新键）。
+> `./mvnw clean verify` **196 个测试通过**（新增 17 个，真实 MySQL `tokenx_test`：快照/类型/空 activityId/
+> 截止时间、同键重放、同键换套餐、跨渠道复用键的双向 409、不同键重复购买、404/409/400/401 稳定响应、
+> 下架后重放、普通购买前后活动库存不变、客户端篡改字段被忽略、并发同键仅一单、并发不同键 6 单、
+> 套餐 `FOR SHARE` 被 `FOR UPDATE` 阻塞后读到已下架状态）；F4 秒杀库存/一人一单/回滚/幂等测试全部保持通过。
+> 前端 `pnpm lint` / `test`(**34**) / `build` / `format:check` 通过（Node 26.9.0，pnpm 12.14.0）。
 
 **范围**：新增 `POST /api/v1/orders` 与 `NormalOrderService`；校验在售套餐并把价格、额度快照写入既有 `purchase_order`。不碰活动库存，不另建订单表，不引入策略模式。
 
@@ -193,4 +216,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2、F3、F4 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F4.5。
+> F0-1～F0-3、F1、F2、F3、F4、F4.5 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F5。

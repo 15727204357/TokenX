@@ -57,3 +57,29 @@ export async function fetchOrder(orderNo: string): Promise<OrderDetail> {
   const { data } = await http.get<OrderDetail>(`/orders/${orderNo}`);
   return data;
 }
+
+/**
+ * Creates one normal purchase: an on-sale package bought at its list price.
+ *
+ * <p>Only `packageId` is sent. The package name, the credits, the price and the payment deadline are
+ * all decided by the server and returned as snapshots — a browser that sent a price would only be
+ * telling the server what it would like to pay.
+ *
+ * <p>The idempotency key has the same meaning as on the seckill endpoint and is supplied by the
+ * caller for the same reason: it identifies one purchase attempt, so it must survive a retry and must
+ * never be shared between two different packages.
+ *
+ * @param packageId package being bought
+ * @param idempotencyKey canonical UUID identifying this purchase attempt
+ */
+export async function createNormalOrder(
+  packageId: number,
+  idempotencyKey: string,
+): Promise<OrderDetail> {
+  const { data } = await http.post<OrderDetail>(
+    '/orders',
+    { packageId },
+    { headers: { 'Idempotency-Key': idempotencyKey } },
+  );
+  return data;
+}

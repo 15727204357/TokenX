@@ -384,6 +384,8 @@ erDiagram
 
 **F4 落地情况**：`V8` 已按上表建立全部列、5 个二级索引与 8 条 `CHECK`（`order_type`、`status`、`SECKILL⇔activity_id`、额度/金额上下限、三个终态时间组合）。F4 只写 `SECKILL` + `UNPAID`，`NORMAL` 与支付/关单留给 F4.5/F5/F6，因此 `paid_at`/`closed_at` 目前恒为 `NULL`，但约束已就位。`uk_activity_user` 是"一人一活动一单"的最终防线，**永久保留**：F6 关闭订单时只改订单状态，不删除订单行，所以关单之后依然无法重抢。`order_no` 由应用生成 26 位 Crockford Base32（10 位毫秒时间 + 16 位 80 bit 随机尾），不引入序列表。
 
+**F4.5 落地情况（2026-10-21）**：普通购买直接复用上表，**零 DDL**——`order_type = 2`（`NORMAL`）、`activity_id = NULL`、`status = 0`、`expires_at = created_at + 支付超时`，名称/额度/标价来自下单时 `FOR SHARE` 读到的套餐行。`ck_order_activity` 保证 `NORMAL` 必须没有 `activity_id`；`uk_activity_user` 因 NULL 不参与唯一比较而天然放过普通订单，所以同一用户可以持有多张同套餐订单，`idx_order_user` 仍可服务"我的订单"。交易只写一次 `purchase_order`（1 次聚簇插入 + 5 次二级索引插入），**不读写** `activity_inventory`，因此这条路径没有行锁竞争，只有同一套餐被下架时才与 `token_package` 的 `FOR UPDATE` 相遇。Flyway 仍停在 V8。
+
 ---
 
 ### 4.6 `token_account` —— 额度余额
@@ -765,13 +767,15 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V6 | `V6__create_seckill_activity.sql` | F3 | `seckill_activity` |
 | V7 | `V7__create_activity_inventory.sql` | F3 | `activity_inventory` |
 | V8 | `V8__create_purchase_order.sql` | F4 | `purchase_order` |
+| —（无） | 无 | F4.5 | 普通购买**不新增迁移**：复用 V8 的 `order_type`、可空 `activity_id` 与 `ck_order_activity` |
 | V9 | `V9__create_token_ledger.sql` | F5 | `token_ledger` |
 | V10 | `V10__create_outbox_event.sql` | F8 | 事务后事件 Outbox |
 | V11 | `V11__create_processed_message.sql` | F8 | 独立下游消费幂等 |
 | V12 | `V12__create_seckill_request.sql` | F9 | 异步秒杀最终请求结果 |
 
-> 截至 F4：V1～V8 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
+> 截至 F4.5：V1～V8 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
 > 唯一键、CHECK、`NULL activity_id` 的唯一键语义、重复 migrate 零变更）；V9 及以后属于后续任务。
+> F4.5 只加代码不加列，Flyway 仍停在 V8。
 
 ### 11.2 规则
 
@@ -975,4 +979,5 @@ NormalOrderService.place():   @Transactional
 | 不采用 | 手写 Singleton（破坏 DI/事务代理）；现在引入 Strategy（差异只有一步）；订单分表（方案 C，代价见 §15.4） |
 | 后果 | `purchase_order` 保留 `order_type` 与可空 `activity_id`；`uk_activity_user` 依赖 NULL 不参与唯一，天然放过普通订单 |
 | 实施顺序 | 秒杀下单（F4）→ **普通购买下单（F4.5）** → 模拟支付与钱包（F5）→ 超时关闭（F6）；`docs/DEVELOPMENT_PLAN.md` 已同步 |
+| 实施状态（2026-10-21） | F4 与 F4.5 均已完成：两个入口、两个事务方法（`SeckillOrderService` / `NormalOrderService`）、一张表、一个查询入口。共享部分收敛为 `OrderDraft`（快照装配 + 单号 + 截止时间）、`OrderReplays`（幂等查询与 `IDEMPOTENCY_KEY_REUSED`）、`OrderQueryService`（两种渠道共用的订单查询）；没有接口、Strategy、Factory 或手写 Singleton |
 | 复审触发 | 出现第三种售卖形态，或两条线路差异变成多步不同顺序时，回到 §15.6 |

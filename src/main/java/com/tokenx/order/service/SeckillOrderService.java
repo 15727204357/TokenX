@@ -5,14 +5,10 @@ import com.tokenx.activity.mapper.ActivityInventoryMapper;
 import com.tokenx.activity.service.ActivityService;
 import com.tokenx.catalog.service.CatalogService;
 import com.tokenx.infrastructure.error.BusinessException;
-import com.tokenx.order.config.OrderProperties;
-import com.tokenx.order.dto.OrderResponse;
 import com.tokenx.order.mapper.PurchaseOrderMapper;
-import com.tokenx.order.model.OrderStatus;
-import com.tokenx.order.model.OrderType;
 import com.tokenx.order.model.PurchaseOrder;
 import com.tokenx.order.support.IdempotencyKeys;
-import com.tokenx.order.support.OrderNoGenerator;
+import com.tokenx.order.support.OrderTarget;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -27,10 +23,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * Synchronous seckill ordering: MySQL is the only thing that decides who wins.
  *
- * <p>This is the strong-consistency baseline. There is no Redis pre-check, no message queue, no
- * local buffer and no distributed lock in the correctness path — every rule below is enforced by a
- * statement the database executes atomically, so the result is the same whether one buyer or a
- * thousand arrive at once.
+ * <p>This is the strong-consistency baseline. There is no Redis pre-check, no message queue, no local
+ * buffer and no distributed lock in the correctness path — every rule below is enforced by a statement
+ * the database executes atomically, so the result is the same whether one buyer or a thousand arrive
+ * at once.
  *
  * <p><b>The reservation order is fixed</b> and follows {@code DATABASE_DESIGN.md §5.1}:
  *
@@ -41,29 +37,33 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       [startAt, endAt)};
  *   <li>prepare the order number, the deadline and every snapshot <em>before</em> the stock lock, so
  *       the time between taking the stock row and committing contains two statements only;
- *   <li>conditional {@code UPDATE activity_inventory ... WHERE available_stock > 0} — the affected
- *       row count is the sold-out answer, never a previously read number;
+ *   <li>conditional {@code UPDATE activity_inventory ... WHERE available_stock > 0} — the affected row
+ *       count is the sold-out answer, never a previously read number;
  *   <li>{@code INSERT purchase_order}, then commit, then answer.
  * </ol>
  *
  * <p><b>Uniqueness is enforced once, by the database.</b> Two unique keys do the work: {@code
  * uk_user_request} replays a retried request, {@code uk_activity_user} makes "one order per user per
  * activity" permanent. There is deliberately no pre-check of {@code (activity_id, user_id)}: it could
- * never be authoritative, so for a serial re-buy it would only add a read to the hot path and leave
- * the real decision to the same unique key. The re-buy is stopped by the constraint, one unit of
- * stock is reserved and then rolled back with the failed insert, and the client gets {@code 409}.
+ * never be authoritative, so for a serial re-buy it would only add a read to the hot path and leave the
+ * real decision to the same unique key. The re-buy is stopped by the constraint, one unit of stock is
+ * reserved and then rolled back with the failed insert, and the client gets {@code 409}.
  *
  * <p><b>A duplicate key rolls back the whole creation.</b> The insert is the last statement of the
- * transaction, so a conflict means the reservation taken in step 4 must disappear too. Swallowing
- * the exception and committing would leave stock consumed by an order that does not exist. The
- * transaction therefore rolls back completely and the cause is diagnosed <em>after</em> it ended, in
- * a fresh read, because inside the old one the winner's row may be invisible and the losing
- * transaction is doomed anyway.
+ * transaction, so a conflict means the reservation taken in step 4 must disappear too. Swallowing the
+ * exception and committing would leave stock consumed by an order that does not exist. The transaction
+ * therefore rolls back completely and the cause is diagnosed <em>after</em> it ended, in a fresh read,
+ * because inside the old one the winner's row may be invisible and the losing transaction is doomed
+ * anyway.
+ *
+ * <p><b>What this class shares with the normal purchase channel</b> is the order row itself ({@link
+ * OrderDraft}), the idempotency lookup ({@link OrderReplays}) and the read-back ({@link
+ * OrderQueryService}). What it does not share is the reason it is the hard channel: reserving stock,
+ * and refusing a second order for the same activity. Those stay here, so the two transaction bodies
+ * remain two clearly different things.
  */
 @Service
 public class SeckillOrderService {
-
-  static final String VALIDATION_FAILED = "VALIDATION_FAILED";
 
   /** The activity exists and is published, but there is no stock left. */
   static final String ACTIVITY_SOLD_OUT = "ACTIVITY_SOLD_OUT";
@@ -71,23 +71,12 @@ public class SeckillOrderService {
   /** This user already owns an order for this activity; the rule is permanent. */
   static final String ALREADY_PURCHASED = "ALREADY_PURCHASED";
 
-  /** The same idempotency key was already used for a different activity. */
-  static final String IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED";
-
-  static final String ORDER_NOT_FOUND = "ORDER_NOT_FOUND";
-
-  /**
-   * Order numbers are random, so a collision is astronomically unlikely. It is still bounded: after
-   * this many attempts the duplicate is reported as the real failure instead of retrying forever.
-   */
-  private static final int MAX_ORDER_NO_ATTEMPTS = 3;
-
   private final PurchaseOrderMapper orderMapper;
   private final ActivityInventoryMapper inventoryMapper;
   private final ActivityService activityService;
   private final CatalogService catalogService;
-  private final OrderNoGenerator orderNoGenerator;
-  private final OrderProperties orderProperties;
+  private final OrderDraft orderDraft;
+  private final OrderReplays orderReplays;
   private final Clock clock;
   private final TransactionTemplate writeTemplate;
   private final TransactionTemplate readTemplate;
@@ -97,16 +86,16 @@ public class SeckillOrderService {
       ActivityInventoryMapper inventoryMapper,
       ActivityService activityService,
       CatalogService catalogService,
-      OrderNoGenerator orderNoGenerator,
-      OrderProperties orderProperties,
+      OrderDraft orderDraft,
+      OrderReplays orderReplays,
       Clock clock,
       PlatformTransactionManager transactionManager) {
     this.orderMapper = orderMapper;
     this.inventoryMapper = inventoryMapper;
     this.activityService = activityService;
     this.catalogService = catalogService;
-    this.orderNoGenerator = orderNoGenerator;
-    this.orderProperties = orderProperties;
+    this.orderDraft = orderDraft;
+    this.orderReplays = orderReplays;
     this.clock = clock;
     // Explicit boundaries rather than @Transactional: the duplicate-key diagnosis has to run after
     // the transaction has ended, and a self-invoking annotated method would silently join the very
@@ -130,7 +119,7 @@ public class SeckillOrderService {
   public CreatedOrder create(long userId, long activityId, UUID requestKey) {
     byte[] requestId = IdempotencyKeys.toBytes(requestKey);
 
-    for (int attempt = 1; attempt <= MAX_ORDER_NO_ATTEMPTS; attempt++) {
+    for (int attempt = 1; attempt <= OrderDraft.MAX_ORDER_NO_ATTEMPTS; attempt++) {
       try {
         CreatedOrder created =
             writeTemplate.execute(status -> createInTransaction(userId, activityId, requestId));
@@ -144,7 +133,7 @@ public class SeckillOrderService {
         }
         // Neither unique key explains the duplicate, so only `uk_order_no` is left. Try another
         // number; if the last attempt also collides, report the real failure instead of looping.
-        if (attempt == MAX_ORDER_NO_ATTEMPTS) {
+        if (attempt == OrderDraft.MAX_ORDER_NO_ATTEMPTS) {
           throw ex;
         }
       }
@@ -152,51 +141,32 @@ public class SeckillOrderService {
     throw new IllegalStateException("unreachable: the retry loop either returned or threw");
   }
 
-  /**
-   * The order behind one public order number, as seen by its owner.
-   *
-   * <p>Ownership is part of the query. A malformed number is a {@code 400} (it cannot exist), while
-   * a well-formed one that matches nothing — because it is unknown <em>or</em> belongs to somebody
-   * else — is the same {@code 404}, so the endpoint cannot be used to discover other buyers' orders.
-   */
-  public OrderResponse findOwnOrder(long userId, String orderNo) {
-    if (!OrderNoGenerator.isCanonical(orderNo)) {
-      throw new BusinessException(
-          HttpStatus.BAD_REQUEST,
-          VALIDATION_FAILED,
-          "orderNo must be 26 characters of Crockford Base32");
-    }
-    PurchaseOrder order =
-        orderMapper.selectByOrderNoAndUser(OrderNoGenerator.canonical(orderNo), userId);
-    if (order == null) {
-      throw new BusinessException(HttpStatus.NOT_FOUND, ORDER_NOT_FOUND, "order not found");
-    }
-    return OrderResponse.from(order);
-  }
-
   // --- transaction body -------------------------------------------------------------------------
 
   private CreatedOrder createInTransaction(long userId, long activityId, byte[] requestId) {
-    // 1. A retried request is answered before anything is validated or deducted, so an order that
-    //    was really created stays reachable even if the activity has ended in the meantime.
-    PurchaseOrder existing = orderMapper.selectByUserAndRequest(userId, requestId);
+    // 1. A retried request is answered before anything is validated or deducted, so an order that was
+    //    really created stays reachable even if the activity has ended in the meantime.
+    PurchaseOrder existing = orderReplays.find(userId, requestId, OrderTarget.seckill(activityId));
     if (existing != null) {
-      if (!Objects.equals(existing.getActivityId(), activityId)) {
-        throw idempotencyKeyReused();
-      }
       return new CreatedOrder(existing, false);
     }
 
-    // 2. One clock reading for the whole creation: the window decision, created_at and expires_at
-    //    must describe the same instant, and the client's clock has no say in any of them.
+    // 2. One clock reading for the whole creation: the window decision, created_at and expires_at must
+    //    describe the same instant, and the client's clock has no say in any of them.
     Instant now = clock.instant().truncatedTo(ChronoUnit.MILLIS);
     ActivityOrderSnapshot activity = activityService.requireOrderable(activityId, now);
 
     // 3. Everything that will be written is prepared here, before the stock row is locked.
-    PurchaseOrder order = newOrder(userId, activity, requestId, now);
+    PurchaseOrder order =
+        orderDraft.buildSeckill(
+            userId,
+            requestId,
+            activity,
+            catalogService.packageNameFor(activity.packageId()),
+            now);
 
     // 4. Reserve exactly one unit, or learn that there is none left.
-    if (inventoryMapper.reserveOne(activityId) != 1) {
+    if (inventoryMapper.reserveOne(activity.activityId()) != 1) {
       throw new BusinessException(
           HttpStatus.CONFLICT, ACTIVITY_SOLD_OUT, "activity is sold out");
     }
@@ -204,25 +174,6 @@ public class SeckillOrderService {
     // 5. Last statement: the order itself. A conflict here aborts the reservation above.
     orderMapper.insert(order);
     return new CreatedOrder(order, true);
-  }
-
-  private PurchaseOrder newOrder(
-      long userId, ActivityOrderSnapshot activity, byte[] requestId, Instant now) {
-    PurchaseOrder order = new PurchaseOrder();
-    order.setOrderNo(orderNoGenerator.next(now));
-    order.setRequestId(requestId);
-    order.setUserId(userId);
-    order.setPackageId(activity.packageId());
-    order.setActivityId(activity.activityId());
-    order.setOrderType(OrderType.SECKILL);
-    order.setPackageNameSnapshot(catalogService.packageNameFor(activity.packageId()));
-    order.setCreditAmount(activity.creditAmount());
-    order.setPayAmountCent(activity.activityPriceCent());
-    order.setStatus(OrderStatus.UNPAID);
-    order.setExpiresAt(PurchaseOrder.toColumn(now.plus(orderProperties.paymentTimeout())));
-    order.setCreatedAt(PurchaseOrder.toColumn(now));
-    order.setUpdatedAt(PurchaseOrder.toColumn(now));
-    return order;
   }
 
   /**
@@ -238,11 +189,9 @@ public class SeckillOrderService {
   private CreatedOrder resolveDuplicate(long userId, long activityId, byte[] requestId) {
     return readTemplate.execute(
         status -> {
-          PurchaseOrder byRequest = orderMapper.selectByUserAndRequest(userId, requestId);
+          PurchaseOrder byRequest =
+              orderReplays.find(userId, requestId, OrderTarget.seckill(activityId));
           if (byRequest != null) {
-            if (!Objects.equals(byRequest.getActivityId(), activityId)) {
-              throw idempotencyKeyReused();
-            }
             return new CreatedOrder(byRequest, false);
           }
           if (orderMapper.selectByActivityAndUser(activityId, userId) != null) {
@@ -253,12 +202,5 @@ public class SeckillOrderService {
           }
           return null;
         });
-  }
-
-  private static BusinessException idempotencyKeyReused() {
-    return new BusinessException(
-        HttpStatus.CONFLICT,
-        IDEMPOTENCY_KEY_REUSED,
-        "Idempotency-Key was already used for a different activity");
   }
 }

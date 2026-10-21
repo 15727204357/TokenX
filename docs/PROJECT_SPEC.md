@@ -168,7 +168,7 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | GET | `/activities/{id}` | 活动详情、运行状态和库存展示（仅 `PUBLISHED`；不存在/草稿/已下架同为 `404 ACTIVITY_NOT_FOUND`） | F3 |
 | POST | `/activities/{id}/orders` | 秒杀下单。**无请求体**，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同一键重放 `200`（不再次扣库存）。失败：`400 VALIDATION_FAILED`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_NOT_ACTIVE`/`ACTIVITY_SOLD_OUT`/`ALREADY_PURCHASED`/`IDEMPOTENCY_KEY_REUSED` | F4 |
 | GET | `/orders/{orderNo}` | 按不可枚举对外单号查询**自己的**订单；不存在与他人订单同为 `404 ORDER_NOT_FOUND`，格式非法 `400 VALIDATION_FAILED` | F4 |
-| POST | `/orders` | 普通购买；Header `Idempotency-Key` | F4.5 |
+| POST | `/orders` | 普通购买。请求体只有 `{"packageId":<正整数>}`，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同键同套餐重放 `200`。失败：`400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 PRODUCT_NOT_FOUND`、`409 PACKAGE_NOT_AVAILABLE`/`IDEMPOTENCY_KEY_REUSED` | F4.5 |
 | POST | `/orders/{orderNo}/mock-pay` | 模拟支付 | F5 |
 | GET | `/wallet` | 查询余额 | F5 |
 | GET | `/wallet/ledger` | 流水分页 | F5 |
@@ -184,7 +184,7 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - 200：读或幂等重试返回已有结果；F4 的同一 `Idempotency-Key` 重放也返回 200（表示“没有再次扣库存”）。
 - 201：本次请求真的创建了订单；F9 的独立异步入口返回 202 + `requestId`，不改变 V1 同步接口语义。
 - 400：非法参数；401：未登录；403：无权限；404：资源不存在；409：重复资格/状态冲突；429：限流；500：预期外故障。
-- 同一 `Idempotency-Key` 携带不同参数必须拒绝，不允许静默复用（F4 返回 `409 IDEMPOTENCY_KEY_REUSED`，且不消耗另一活动库存）。
+- 同一 `Idempotency-Key` 携带不同参数必须拒绝，不允许静默复用（F4 返回 `409 IDEMPOTENCY_KEY_REUSED`，且不消耗另一活动库存）。F4.5 起幂等的比较对象是**订单类型 + 目标**：同键换套餐、或把秒杀用过的键用于普通购买（含反向），一律 `409`，即使指向同一套餐。
 
 ### 7.1 下单语义（F4，MySQL 强一致基线）
 
@@ -194,6 +194,23 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - **已有订单优先于活动状态**：重放判定在活动校验之前，活动结束或下架后仍能取回原订单。
 - **订单只有 `UNPAID`**：支付（F5）与超时关闭/释放库存（F6）不在本阶段；`expires_at` 由 `expires_at = created_at + tokenx.order.payment-timeout` 在创建时固化。
 - 并发集成测试测的是正确性（成功数 = 初始库存、库存不为负、失败只返回稳定业务码），**不是**压测数据。
+
+### 7.2 普通购买语义（F4.5）
+
+- **两个接口、两个 Service、同一张订单表**：`POST /activities/{id}/orders` → `SeckillOrderService`，
+  `POST /orders` → `NormalOrderService`；两者共用 `purchase_order`、`GET /orders/{orderNo}`、`OrderResponse`
+  与（F5 起的）支付、关单状态机。分开的只有入口与事务内容（是否预占库存）。
+- **不碰活动库存**：普通订单 `activity_id = NULL`、`order_type = NORMAL`，事务内不读也不改
+  `activity_inventory`；`status = UNPAID`，`expires_at = created_at + tokenx.order.payment-timeout`。
+- **事务顺序**：查 `(user_id, request_id)` → 一次 `Clock` 读取 → 套餐主键 `FOR SHARE` 且必须 `ON_SALE`
+  （同时取得名称/额度/标价快照）→ `INSERT purchase_order` → 提交 → 返回。
+- **无一人一单**：不同幂等键可重复购买同一套餐，每次都是独立订单。`uk_activity_user` 在
+  `activity_id IS NULL` 时不参与唯一比较，天然不限制普通订单，也不新增任何“一人一普通套餐一单”约束。
+- **错误码**：套餐不存在 `404 PRODUCT_NOT_FOUND`；已下架 `409 PACKAGE_NOT_AVAILABLE`；非法/缺失
+  幂等键、非法请求体（含无法解析的 JSON）`400 VALIDATION_FAILED`；未登录 `401 UNAUTHORIZED`。
+- **已有订单优先于套餐状态**：重放判定在套餐校验之前，因此订单创建后套餐下架，仍可用同一幂等键取回。
+- **与管理员下架协调**：下单对套餐行持 `FOR SHARE`，上下架走同一主键的 `FOR UPDATE`，不会基于过期状态建单。
+- 普通购买同样只有 `UNPAID`：支付在 F5、超时关闭在 F6，均不区分渠道，但关闭时只有秒杀订单需要释放预留库存。
 
 ## 8. 运行时拓扑（V1）
 

@@ -2,11 +2,12 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4` 完成——最小可运行骨架、MySQL 迁移链路、
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5` 完成——最小可运行骨架、MySQL 迁移链路、
 > Redis 连通性、数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
 > （管理员创建/上下架、游客游标分页列表与详情、公开列表页），秒杀活动配置与库存初始化
-> （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），以及**同步秒杀下单**
-> （MySQL 条件扣库存 + 唯一键一人一单 + 幂等键重放、订单详情页）。
+> （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），**同步秒杀下单**
+> （MySQL 条件扣库存 + 唯一键一人一单 + 幂等键重放、订单详情页），以及**普通购买下单**
+> （按套餐标价直接下单，不碰活动库存、无一人一单限制，与秒杀共用订单表、查询与后续状态机）。
 > 支付与钱包接口尚未实现（F5 起），订单超时关闭在 F6。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
@@ -215,7 +216,7 @@ curl -s http://localhost:8080/api/v1/activities/1
 - 每人每活动最多一单是项目固定规则（F4 用唯一键落实），响应里固定返回 `purchaseLimit = 1`，
   不为此增加一个只能取 1 的数据库列。
 
-## 下单接口（F4）
+## 下单接口（F4 秒杀 / F4.5 普通购买）
 
 **这一步是 MySQL 强一致基线**：判断谁抢到的只有数据库语句本身。正确性路径上**没有** Redis 预扣、
 Kafka/消息队列、本地内存队列或分布式锁——下单结果与并发量无关，只与库存行和唯一键有关。
@@ -223,16 +224,25 @@ Kafka/消息队列、本地内存队列或分布式锁——下单结果与并�
 | 方法 | 路径 | 说明 | 成功 | 主要失败 |
 |---|---|---|---|---|
 | POST | `/activities/{id}/orders` | 秒杀下单（需登录）。**无请求体**；必须带 `Idempotency-Key`（规范 36 位 UUID） | `201`（本次创建）或 `200`（同一 key 重放，不扣库存） | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_NOT_ACTIVE` / `ACTIVITY_SOLD_OUT` / `ALREADY_PURCHASED` / `IDEMPOTENCY_KEY_REUSED` |
-| GET | `/orders/{orderNo}` | 查询**自己的**订单（需登录） | `200` 订单快照 | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ORDER_NOT_FOUND`（不存在与他人订单完全一致） |
+| POST | `/orders` | 普通购买（需登录）。请求体只有 `{"packageId":123}`；必须带 `Idempotency-Key` | `201`（本次创建）或 `200`（同一 key 同套餐重放） | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 PRODUCT_NOT_FOUND`、`409 PACKAGE_NOT_AVAILABLE` / `IDEMPOTENCY_KEY_REUSED` |
+| GET | `/orders/{orderNo}` | 查询**自己的**订单（需登录），两种渠道共用 | `200` 订单快照 | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ORDER_NOT_FOUND`（不存在与他人订单完全一致） |
 
 ```bash
-# 下单：单号由服务端生成，客户端只提供幂等键
+# 秒杀下单：单号由服务端生成，客户端只提供幂等键
 curl -s -X POST "http://localhost:8080/api/v1/activities/1/orders" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Idempotency-Key: $(uuidgen | tr 'A-Z' 'a-z')"
 # 201 -> {"orderNo":"...","orderType":"SECKILL","status":"UNPAID","payAmountCent":799,...}
 
-# 查询自己的订单
+# 普通购买：只传套餐 id，价格/额度/名称/截止时间都由服务端写入快照
+curl -s -X POST "http://localhost:8080/api/v1/orders" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: $(uuidgen | tr 'A-Z' 'a-z')" \
+  -H "Content-Type: application/json" \
+  -d '{"packageId":1}'
+# 201 -> {"orderNo":"...","orderType":"NORMAL","activityId":null,...}
+
+# 查询自己的订单（两种渠道同一个接口）
 curl -s http://localhost:8080/api/v1/orders/<orderNo> -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -270,6 +280,30 @@ curl -s http://localhost:8080/api/v1/orders/<orderNo> -H "Authorization: Bearer 
   `available_stock` 不为负、`reserved_stock` 等于成功数、失败只返回稳定业务码、不出现 500。
   这些数字**不是** QPS/TPS 压测结果，不得当作性能指标引用。
 
+### 普通购买（F4.5）
+
+普通购买与秒杀是**两个接口、两个 Service、同一张订单表和同一套查询/后续状态机**。分开的只有入口与
+事务内容（是否预占库存），共享的是订单生命周期——支付、关单、查单将来都只写一份。
+
+- **`NormalOrderService` 单独一个事务入口**，顺序是：① 按 `(user_id, request_id)` 查已有订单 →
+  ② 一次 `Clock` 读取 → ③ `token_package` 主键 `FOR SHARE` 读出并校验 `ON_SALE`，同时取得名称、
+  额度与标价快照 → ④ `INSERT purchase_order` → ⑤ `COMMIT`。**没有活动、没有库存行、没有任何扣减**，
+  普通购买前后 `activity_inventory` 完全不变。
+- **不碰 `activity_inventory`**，也不读它：普通购买属于另一个渠道，凭空检查库存只会让两个渠道互相牵连。
+- **可重复购买**：同一用户用不同幂等键可以买同一套餐任意多次，每次都是独立订单。
+  `uk_activity_user(activity_id,user_id)` 在 `activity_id=NULL` 时天然不限制普通订单（MySQL 唯一索引
+  不比较 NULL），因此**没有**“一人一普通套餐一单”的约束，也不需要加。
+- **幂等键比较包含订单类型与目标**：同键同套餐 → `200` 重放原订单；同键换套餐 → `409
+  IDEMPOTENCY_KEY_REUSED`；把秒杀用过的键拿来普通购买（或反过来）也是 `409`，即使两者指向同一个套餐。
+  重放判定在套餐校验之前，所以订单创建后套餐被下架，仍能用同一个键取回原订单。
+- **套餐校验与管理员下架协调**：下单事务对套餐行持 `FOR SHARE`，管理员下架走同一主键行的
+  `FOR UPDATE`，因此二者不可能交错读到过期状态——要么下单先提交（订单成立），要么下架先提交
+  （下单拿到 `409 PACKAGE_NOT_AVAILABLE`）。这条竞争有真实 MySQL 并发测试覆盖。
+- **没有一人一单、没有售罄**：普通购买的错误只有 `404 PRODUCT_NOT_FOUND`（套餐不存在）、
+  `409 PACKAGE_NOT_AVAILABLE`（已下架）、`409 IDEMPOTENCY_KEY_REUSED`。
+- **F4.5 不新增迁移**：`V8__create_purchase_order.sql` 里的 `order_type`、可空 `activity_id` 与
+  `ck_order_activity` 已经为 `NORMAL` 准备好，Flyway 仍停在 V8。
+
 ## 前端（`frontend/`）
 
 ```bash
@@ -282,15 +316,20 @@ pnpm build
 ```
 
 页面：登录 / 注册并登录、当前用户、公开的套餐列表 `/products`（未登录可访问，展示名称、Token
-额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页）、公开的活动详情
-`/activities/:id`（展示活动价、Token 额度、起止时间、可用库存与 `UPCOMING`/`ACTIVE`/`ENDED`；
-库存为 0 时显示“已售罄”），以及订单详情 `/orders/:orderNo`（展示服务端快照：单号、套餐、额度、
-应付金额与支付截止）。Token 存在浏览器 `localStorage`，由统一的 HTTP 拦截器附加到请求头。
+额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页，每个在售套餐带“立即购买”入口）、
+公开的活动详情 `/activities/:id`（展示活动价、Token 额度、起止时间、可用库存与
+`UPCOMING`/`ACTIVE`/`ENDED`；库存为 0 时显示“已售罄”），以及订单详情 `/orders/:orderNo`
+（展示服务端快照：单号、套餐、额度、应付金额与支付截止）。Token 存在浏览器 `localStorage`，
+由统一的 HTTP 拦截器附加到请求头。
 
 活动页的抢购按钮只在服务端返回 `ACTIVE` 且未售罄时可点，其余状态按钮禁用并写明原因（即将开始 /
 活动已结束 / 已售罄）；未登录点击跳转登录页，登录后点击才真正下单。每次下单用浏览器原生
 `crypto.randomUUID()` 生成幂等键；**网络中断或 5xx 之后重试复用同一个键**（服务端可能已经建单），
 而业务拒绝（如已购买、已售罄）视为明确答复，下一次尝试会换新键。
+
+套餐列表的“立即购买”是普通购买渠道：未登录点击只跳 `/login`、不发请求；登录后只发送 `packageId`
+与幂等键，成功即跳转订单详情页，请求进行中所有购买按钮禁用。幂等键**按套餐保存**——同一套餐网络失败
+后重试复用原键，切到另一个套餐则用新键，避免把 A 的未决请求键拿去买 B。
 
 活动页只展示服务端返回的 `runtimeStatus`，不在浏览器里比较时间来判断活动是否开始——否则前端与
 后端会在边界时刻给出不同答案。时间按 `Asia/Shanghai`（UTC+8）格式化，仅用于展示。订单页同样
@@ -303,6 +342,8 @@ pnpm build
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
   `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
   `activity_inventory`（F3）、`V8` `purchase_order`（F4）。
+- **F4.5 没有新增迁移**：普通购买复用 `V8` 已建好的 `order_type` / 可空 `activity_id` /
+  `ck_order_activity`，Flyway 版本仍是 V8。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
   （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V8 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
@@ -329,7 +370,7 @@ src/main/java/com/tokenx/
 │   ├── controller/  service/  mapper/  model/  dto/
 ├── activity/                       F3 活动模块：创建、发布/下架、公开详情、活动快照与条件扣库存
 │   ├── controller/  service/  mapper/  model/  dto/
-├── order/                          F4 订单模块：同步秒杀下单、幂等键、订单查询
+├── order/                          F4/F4.5 订单模块：秒杀下单、普通购买、幂等键、订单查询
 │   ├── controller/  service/  mapper/  model/  dto/  support/  config/
 └── infrastructure/                 通用基础设施（安全、异常转换、时间源、外部适配）
     ├── web/                        健康检查、统一错误、requestId

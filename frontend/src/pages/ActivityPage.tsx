@@ -6,6 +6,7 @@ import { createSeckillOrder } from '../api/orders';
 import { useAuth } from '../auth/useAuth';
 import { formatInstant, formatPrice } from '../lib/format';
 import { newIdempotencyKey } from '../lib/idempotency';
+import { mightHaveReachedTheServer } from '../lib/purchase';
 
 const RUNTIME_LABEL: Record<ActivityRuntimeStatus, string> = {
   UPCOMING: '即将开始',
@@ -62,18 +63,6 @@ function purchaseMessage(error: unknown): string {
     }
   }
   return '下单失败，请稍后重试';
-}
-
-/**
- * Whether a failure might have left an order behind on the server.
- *
- * <p>These are exactly the cases where the request may have been committed without the browser
- * seeing the response, so the next attempt must reuse the same idempotency key. A business rejection
- * (`409`, `400`) is a definite answer — nothing was created — so a retry is a genuinely new attempt
- * and gets a new key.
- */
-function mightHaveReachedTheServer(error: unknown): boolean {
-  return error instanceof ApiError && (error.status === 0 || error.status >= 500);
 }
 
 /**

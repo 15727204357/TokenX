@@ -94,7 +94,7 @@ public class ActivityService {
     requireValidWindow(startAt, endAt, now);
 
     PackageSnapshot tokenPackage =
-        catalogService.requireOnSalePackageForActivity(request.packageId());
+        catalogService.requireOnSalePackage(request.packageId());
 
     SeckillActivity activity = new SeckillActivity();
     activity.setPackageId(tokenPackage.id());
@@ -149,7 +149,7 @@ public class ActivityService {
         throw stateConflict("activity has already ended and cannot be published");
       }
       PackageSnapshot tokenPackage =
-          catalogService.requireOnSalePackageForActivity(activity.getPackageId());
+          catalogService.requireOnSalePackage(activity.getPackageId());
       activityMapper.publish(id, tokenPackage.creditAmount());
       activity.setCreditAmountSnapshot(tokenPackage.creditAmount());
     } else {

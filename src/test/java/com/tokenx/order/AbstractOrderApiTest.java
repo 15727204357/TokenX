@@ -163,14 +163,28 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
 
   /** Inserts a package row directly: these tests are about ordering, not about the catalogue API. */
   protected long packageRow(long creditAmount) {
+    return packageRow(creditAmount, creditAmount / 2 + 1, PackageStatus.ON_SALE);
+  }
+
+  /** A package with an explicit list price and status, so a test can control what is snapshotted. */
+  protected long packageRow(long creditAmount, long listPriceCent, PackageStatus status) {
     TokenPackage tokenPackage = new TokenPackage();
     tokenPackage.setName("下单套餐-" + UUID.randomUUID().toString().substring(0, 8));
     tokenPackage.setCreditAmount(creditAmount);
-    tokenPackage.setListPriceCent(creditAmount / 2 + 1);
-    tokenPackage.setStatus(PackageStatus.ON_SALE);
+    tokenPackage.setListPriceCent(listPriceCent);
+    tokenPackage.setStatus(status);
     packageMapper.insert(tokenPackage);
     packageIds.add(tokenPackage.getId());
     return tokenPackage.getId();
+  }
+
+  /** Withdraws a package through the admin endpoint, the way an operator would. */
+  protected ResultActions withdrawPackage(String adminToken, long packageId) throws Exception {
+    return mockMvc.perform(
+        patch("/api/v1/admin/products/" + packageId + "/status")
+            .header("Authorization", "Bearer " + adminToken)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(objectMapper.writeValueAsString(Map.of("status", "OFF_SHELF"))));
   }
 
   protected long createDraft(
@@ -247,6 +261,35 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
         get("/api/v1/orders/" + orderNo).header("Authorization", "Bearer " + token));
   }
 
+  /** Normal purchase of one package, with the documented body. */
+  protected ResultActions placeNormalOrder(String token, long packageId, String idempotencyKey)
+      throws Exception {
+    return placeNormalOrder(token, packageId, idempotencyKey, Map.of("packageId", packageId));
+  }
+
+  /** Normal purchase with a body a client might try to tamper with; only {@code packageId} counts. */
+  protected ResultActions placeNormalOrder(
+      String token, long packageId, String idempotencyKey, Map<String, Object> body)
+      throws Exception {
+    return mockMvc.perform(
+        post("/api/v1/orders")
+            .header("Authorization", "Bearer " + token)
+            .header("Idempotency-Key", idempotencyKey)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(objectMapper.writeValueAsString(body)));
+  }
+
+  /** Normal purchase with a body written verbatim, for bodies that cannot be parsed. */
+  protected ResultActions placeNormalOrderRaw(
+      String token, String idempotencyKey, String rawBody) throws Exception {
+    return mockMvc.perform(
+        post("/api/v1/orders")
+            .header("Authorization", "Bearer " + token)
+            .header("Idempotency-Key", idempotencyKey)
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(rawBody));
+  }
+
   protected static String newKey() {
     return UUID.randomUUID().toString();
   }
@@ -283,6 +326,17 @@ abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   protected List<PurchaseOrder> storedOrders(long activityId) {
     return orderMapper.selectList(
         Wrappers.<PurchaseOrder>lambdaQuery().eq(PurchaseOrder::getActivityId, activityId));
+  }
+
+  /** Every order one buyer owns, whichever channel created it. */
+  protected List<PurchaseOrder> storedOrdersOfUser(long userId) {
+    return orderMapper.selectList(
+        Wrappers.<PurchaseOrder>lambdaQuery().eq(PurchaseOrder::getUserId, userId));
+  }
+
+  /** The package as the database now holds it, for asserting that ordering changed nothing. */
+  protected TokenPackage storedPackage(long packageId) {
+    return packageMapper.selectById(packageId);
   }
 
   protected String body(MvcResult result) throws Exception {
