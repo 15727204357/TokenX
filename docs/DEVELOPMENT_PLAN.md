@@ -68,6 +68,12 @@
 > `GET /products/**` 匿名可读、`/admin/**` 需 `ROLE_ADMIN`（未登录 401、普通用户 403，角色只取自 JWT claim）。
 > `./mvnw clean verify` 74 个测试通过（真实 MySQL `tokenx_test`，含 2 个真实端口 HTTP 冒烟）；
 > 前端 `pnpm lint` / `pnpm test`(10) / `pnpm build` / `pnpm format:check` 通过。
+>
+> 复审修复（2026-10-21 同日，同一分支）：上下架改为事务内 `SELECT ... FOR UPDATE` 锁定单个主键行后再判断，
+> 修掉“条件 UPDATE 影响 0 行后仍读到 REPEATABLE-READ 旧快照”的缺陷（新增真实 MySQL 并发测试，旧实现会返回
+> `OFF_SHELF` 而库里是 `ON_SALE`）；套餐额度/标价加上限 `1e9` / `1e11` 分并由 `V5.1` 追加 CHECK，使数值始终在
+> JavaScript 安全整数范围内；管理端状态接口补 `{id}` 正整数校验；README 的游标分页表述改为“弱一致，不保证跨页快照”。
+> 复测：`./mvnw clean verify` 82 个测试通过，前端 `pnpm lint`/`test`/`build`/`format:check` 通过。
 
 **范围**：管理员创建/上下架套餐、游客读取列表与详情；React 简单列表。不要引入缓存。
 

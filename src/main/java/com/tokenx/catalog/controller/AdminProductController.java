@@ -6,6 +6,7 @@ import com.tokenx.catalog.dto.UpdatePackageStatusRequest;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.service.CatalogService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Positive;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -38,7 +39,8 @@ public class AdminProductController {
   /** Publishes or withdraws a package. Repeating the current status is a success. */
   @PatchMapping("/{id}/status")
   public PackageResponse changeStatus(
-      @PathVariable long id, @Valid @RequestBody UpdatePackageStatusRequest request) {
+      @PathVariable @Positive(message = "id must be positive") long id,
+      @Valid @RequestBody UpdatePackageStatusRequest request) {
     return catalogService.changeStatus(id, PackageStatus.valueOf(request.status()));
   }
 }

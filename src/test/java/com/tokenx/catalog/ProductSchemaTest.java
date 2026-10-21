@@ -3,6 +3,7 @@ package com.tokenx.catalog;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.tokenx.catalog.dto.PackageLimits;
 import com.tokenx.catalog.mapper.TokenPackageMapper;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
@@ -81,6 +82,33 @@ class ProductSchemaTest extends AbstractIntegrationTest {
     assertThatThrownBy(() -> insertRaw("负额度", -1L, 100L))
         .as("the unsigned column type must reject a negative amount")
         .isInstanceOf(Exception.class);
+  }
+
+  @Test
+  void shouldRejectAmountsAboveTheCapAtTheDatabaseLevel() {
+    assertThatThrownBy(
+            () -> insertRaw("超额", PackageLimits.MAX_CREDIT_AMOUNT + 1, 100L))
+        .as("the database must reject a credit amount above the documented cap")
+        .isInstanceOf(SQLException.class);
+
+    assertThatThrownBy(
+            () -> insertRaw("超价", 100L, PackageLimits.MAX_LIST_PRICE_CENT + 1))
+        .as("the database must reject a price above the documented cap")
+        .isInstanceOf(SQLException.class);
+  }
+
+  @Test
+  void shouldAcceptAmountsExactlyAtTheCap() {
+    TokenPackage tokenPackage = newPackage("上限包", PackageStatus.OFF_SHELF);
+    tokenPackage.setCreditAmount(PackageLimits.MAX_CREDIT_AMOUNT);
+    tokenPackage.setListPriceCent(PackageLimits.MAX_LIST_PRICE_CENT);
+
+    packageMapper.insert(tokenPackage);
+    createdIds.add(tokenPackage.getId());
+
+    TokenPackage loaded = packageMapper.selectById(tokenPackage.getId());
+    assertThat(loaded.getCreditAmount()).isEqualTo(PackageLimits.MAX_CREDIT_AMOUNT);
+    assertThat(loaded.getListPriceCent()).isEqualTo(PackageLimits.MAX_LIST_PRICE_CENT);
   }
 
   @Test

@@ -111,8 +111,10 @@ curl -s http://localhost:8080/api/v1/users/me -H "Authorization: Bearer $TOKEN"
 
 ## 套餐接口（F2）
 
-公开读取允许游客访问，写入只允许管理员。列表用**游标分页**（`id < cursor`，`id DESC`），不用
-`OFFSET`，所以翻到深处不会越来越慢，也不会因数据变动出现重复或漏项。
+公开读取允许游客访问，写入只允许管理员。列表用**游标分页**（`id < cursor`，`id DESC`），不用 `OFFSET`：
+翻到深处不会越来越慢，也避免了“头部新增数据把整页往后推”造成的重复读取。代价是它**不提供跨页快照一致性**：
+翻页期间新上架、且 id 大于当前 cursor 的套餐不会出现在本次遍历的后续页面，刷新首屏即可看到。这是公开目录
+已接受的弱一致语义，不是“绝不漏项”。
 
 | 方法 | 路径 | 说明 | 成功 | 主要失败 |
 |---|---|---|---|---|
@@ -143,8 +145,14 @@ curl -s -X PATCH http://localhost:8080/api/v1/admin/products/1/status \
 - 下架只改状态、**不删除记录**（后续活动与历史订单仍指向它），并且立即从公共列表与详情中消失。
 - 名称去首尾空格后必须非空且不超过 96 个字符；`creditAmount` 与 `listPriceCent` 必须是正整数，
   金额只用整数“分”，数据库另有 `CHECK` 兜底（`> 0`、`status IN (0,1)`）。
+- 数值上限：`creditAmount ≤ 1_000_000_000`、`listPriceCent ≤ 100_000_000_000`（= 人民币 10 亿元）。
+  上限集中在 `PackageLimits`，DTO 校验与数据库 `CHECK` 共用同一组数字，超出即 `400 VALIDATION_FAILED`。
+- **整数精度契约**：`id`、`nextCursor`、`creditAmount`、`listPriceCent` 都以 JSON number 返回，浏览器按
+  IEEE-754 双精度解析。因此套餐自增 ID 必须保持在 `2^53-1`（`Number.MAX_SAFE_INTEGER`）以内；未来若引入
+  外部 ID（如订单号、第三方单号），必须用字符串传输，**不得**塞进 JSON number。
 - 套餐名**不唯一**：同名展示套餐是合法的，不构成数据冲突。
 - `GET /products/**` 匿名可读；`/admin/**` 需要 `ROLE_ADMIN`。未登录 `401`，普通用户 `403`。
+- 同一套餐的并发上架/下架由数据库单行锁（`SELECT … FOR UPDATE` 后更新）串行化，重复同一状态幂等返回当前状态。
 - `nextCursor` 只在还有下一页时返回，客户端不需要（也不应该）自己推算游标。
 
 ### 本地管理员（仅本地演示，人工执行）
@@ -177,9 +185,9 @@ pnpm build
 - 迁移脚本位于 `src/main/resources/db/migration/`，命名 `V<版本>__<说明>.sql`。
 - 应用启动时由 Flyway 自动执行；**禁止**手工改已发布的迁移文件，也禁止用 ORM 自动建表覆盖。
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
-  `V5` `token_package`（F2）。
+  `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V5 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V5.1 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥

@@ -251,16 +251,18 @@ erDiagram
 |---|---|---|---|---|
 | `id` | `BIGINT UNSIGNED` | NO | AUTO_INCREMENT | |
 | `name` | `VARCHAR(96)` | NO | — | 展示名 |
-| `credit_amount` | `BIGINT UNSIGNED` | NO | — | 购买后到账额度（整数单位） |
-| `list_price_cent` | `BIGINT UNSIGNED` | NO | — | 标价（分） |
+| `credit_amount` | `BIGINT UNSIGNED` | NO | — | 购买后到账额度（整数单位），`1 ≤ x ≤ 1_000_000_000` |
+| `list_price_cent` | `BIGINT UNSIGNED` | NO | — | 标价（分），`1 ≤ x ≤ 100_000_000_000`（10 亿元） |
 | `status` | `TINYINT` | NO | 0 | 0=OFF_SHELF，1=ON_SALE |
 | `created_at` / `updated_at` | `DATETIME(3)` | NO | 同上 | |
 
-**键与约束**：`PRIMARY KEY(id)`；`KEY idx_package_status (status)`（列表页 `WHERE status=1 ORDER BY id DESC`，InnoDB 二级索引自带主键，无需再写 `(status,id)`）；`CHECK` 兜底：`status IN (0,1)`、`credit_amount > 0`、`list_price_cent > 0`（应用层先校验，数据库再兜底）。`name` **不加唯一键**：同名展示套餐不是数据冲突。
+**键与约束**：`PRIMARY KEY(id)`；`KEY idx_package_status (status)`（列表页 `WHERE status=1 ORDER BY id DESC`，InnoDB 二级索引自带主键，无需再写 `(status,id)`）；`CHECK` 兜底：`status IN (0,1)`、`credit_amount > 0` 且 `≤ 1000000000`、`list_price_cent > 0` 且 `≤ 100000000000`（应用层 `PackageLimits` 先校验，数据库再兜底）。`name` **不加唯一键**：同名展示套餐不是数据冲突。
 
-**查询**：公共列表 `SELECT ... WHERE status=1 AND id<? ORDER BY id DESC LIMIT ?` → `idx_package_status`（游标分页，不用 `OFFSET`）；详情 `WHERE id=? AND status=1` → 主键；管理端全量列表 → 主键扫描（表小，量级百级）。
+**前端整数契约**：`id`、`nextCursor`、`credit_amount`、`list_price_cent` 在 HTTP 上都是 JSON number，浏览器按 IEEE-754 双精度解析，因此 `credit_amount`/`list_price_cent` 必须有上述上限，且套餐自增 `id` 必须保持在 `2^53-1` 以内；未来若出现外部 ID（订单号、第三方单号），一律用字符串传输，不得以 JSON number 承载超过安全整数范围的值。
 
-**读写与热点**：读多写少，缓存友好（F7 可做 Cache-Aside）。无并发写竞争。
+**查询**：公共列表 `SELECT ... WHERE status=1 AND id<? ORDER BY id DESC LIMIT ?` → `idx_package_status`（游标分页，不用 `OFFSET`）；详情 `WHERE id=? AND status=1` → 主键；管理端全量列表 → 主键扫描（表小，量级百级）。游标分页只保证“不因头部新增而重复读”，不提供跨页快照一致性：翻页期间新上架且 `id` 大于当前 cursor 的套餐不会出现在本次遍历的后续页。
+
+**读写与热点**：读多写少，缓存友好（F7 可做 Cache-Aside）。写入低频，但**同一套餐仍可能被并发上下架**：状态修改在事务内先 `SELECT ... FOR UPDATE` 锁定该主键行再判断与更新，用单行锁把同一行的并发写串行化，不影响其他套餐，也不需要版本列。
 
 **冗余**：不冗余活动价。活动价与库存是活动快照，见 §4.3。
 
@@ -739,6 +741,7 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V3 | `V3__create_app_user.sql` | F1 | `app_user` |
 | V4 | `V4__create_token_account.sql` | F1 | `token_account`；注册与用户同事务创建 |
 | V5 | `V5__create_token_package.sql` | F2 | `token_package` |
+| V5.1 | `V5_1__cap_token_package_amounts.sql` | F2（复审修复） | 追加 `credit_amount ≤ 1e9`、`list_price_cent ≤ 1e11` 两条 CHECK；V5 已在本地测试库执行，按“已执行迁移不改”追加，且 5.1 排在 F3 的 V6 之前，不占用后续编号 |
 | V6 | `V6__create_seckill_activity.sql` | F3 | `seckill_activity` |
 | V7 | `V7__create_activity_inventory.sql` | F3 | `activity_inventory` |
 | V8 | `V8__create_purchase_order.sql` | F4 | `purchase_order` |

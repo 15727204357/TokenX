@@ -62,14 +62,17 @@ public class CatalogService {
   /**
    * Publishes or withdraws a package.
    *
-   * <p>Repeating the current status is a success that returns the current state, so an admin client
-   * can retry safely. The update is conditional on the status that was just read: if another request
-   * changed it in between, this one matches zero rows and the answer is still the real current state
-   * rather than a corrupted transition.
+   * <p>The row is locked with {@code SELECT ... FOR UPDATE} before its status is read, so concurrent
+   * status changes of the same package are serialised by the database: the waiting transaction reads
+   * the committed status rather than the snapshot it started with. Only that one primary key row is
+   * locked, and no version column or cross-row lock is involved.
+   *
+   * <p>Repeating the current status returns the current state without executing any {@code UPDATE},
+   * so an admin client can retry safely.
    */
   @Transactional
   public PackageResponse changeStatus(long id, PackageStatus target) {
-    TokenPackage current = packageMapper.selectById(id);
+    TokenPackage current = packageMapper.selectByIdForUpdate(id);
     if (current == null) {
       throw productNotFound();
     }
@@ -77,18 +80,9 @@ public class CatalogService {
       return PackageResponse.from(current);
     }
 
-    packageMapper.update(
-        null,
-        Wrappers.<TokenPackage>lambdaUpdate()
-            .eq(TokenPackage::getId, id)
-            .eq(TokenPackage::getStatus, current.getStatus())
-            .set(TokenPackage::getStatus, target));
-
-    TokenPackage updated = packageMapper.selectById(id);
-    if (updated == null) {
-      throw productNotFound();
-    }
-    return PackageResponse.from(updated);
+    packageMapper.updateStatus(id, target);
+    current.setStatus(target);
+    return PackageResponse.from(current);
   }
 
   /**

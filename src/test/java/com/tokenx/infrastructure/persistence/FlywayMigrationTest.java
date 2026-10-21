@@ -39,7 +39,7 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
             .map(info -> info.getVersion().getVersion())
             .toList();
 
-    assertThat(applied).contains("1", "2", "3", "4", "5");
+    assertThat(applied).contains("1", "2", "3", "4", "5", "5.1");
 
     assertThat(flyway.info().all())
         .as("no migration may be in a failed state")
