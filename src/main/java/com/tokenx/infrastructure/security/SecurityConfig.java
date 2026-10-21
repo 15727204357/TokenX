@@ -8,6 +8,7 @@ import javax.crypto.spec.SecretKeySpec;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -59,6 +60,11 @@ public class SecurityConfig {
             auth ->
                 auth.requestMatchers("/api/v1/health", "/api/v1/auth/**")
                     .permitAll()
+                    // Visitors may browse the catalogue; only writes need an authenticated admin.
+                    .requestMatchers(HttpMethod.GET, "/api/v1/products/**")
+                    .permitAll()
+                    .requestMatchers("/api/v1/admin/**")
+                    .hasRole("ADMIN")
                     .requestMatchers("/actuator/health", "/actuator/info")
                     .permitAll()
                     .anyRequest()

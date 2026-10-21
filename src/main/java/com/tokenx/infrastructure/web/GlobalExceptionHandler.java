@@ -4,6 +4,7 @@ import com.tokenx.infrastructure.error.BusinessException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.MessageSourceResolvable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -12,6 +13,8 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -49,6 +52,36 @@ public class GlobalExceptionHandler {
       HttpMessageNotReadableException ex, HttpServletRequest request) {
     return ResponseEntity.badRequest()
         .body(new ApiError("MALFORMED_REQUEST", "request body cannot be parsed", RequestIdFilter.of(request)));
+  }
+
+  /**
+   * Constraints on query parameters and path variables (for example {@code limit}) are validated by
+   * Spring MVC itself and raise this exception rather than the bean-validation one above. Without
+   * this handler they would fall through to the catch-all and be reported as a server error.
+   */
+  @ExceptionHandler(HandlerMethodValidationException.class)
+  public ResponseEntity<ApiError> handleMethodValidation(
+      HandlerMethodValidationException ex, HttpServletRequest request) {
+    String message =
+        ex.getParameterValidationResults().stream()
+            .flatMap(result -> result.getResolvableErrors().stream())
+            .map(MessageSourceResolvable::getDefaultMessage)
+            .findFirst()
+            .orElse("request is invalid");
+    return ResponseEntity.badRequest()
+        .body(new ApiError("VALIDATION_FAILED", message, RequestIdFilter.of(request)));
+  }
+
+  /** A path variable or query parameter with the wrong type, e.g. {@code /products/abc}. */
+  @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+  public ResponseEntity<ApiError> handleTypeMismatch(
+      MethodArgumentTypeMismatchException ex, HttpServletRequest request) {
+    return ResponseEntity.badRequest()
+        .body(
+            new ApiError(
+                "VALIDATION_FAILED",
+                "parameter '" + ex.getName() + "' has an invalid value",
+                RequestIdFilter.of(request)));
   }
 
   /** Unknown path must stay a 404 instead of being turned into a 500 by the catch-all below. */

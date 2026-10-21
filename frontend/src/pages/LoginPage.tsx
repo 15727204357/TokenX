@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { ApiError } from '../api/http';
 import { useAuth } from '../auth/useAuth';
 
@@ -95,6 +95,9 @@ export function LoginPage() {
       </form>
       <p className="hint">
         用户名 {USERNAME_HINT}，密码{PASSWORD_HINT}。注册成功后会自动登录。
+      </p>
+      <p className="hint">
+        <Link to="/products">先看看 Token 套餐（无需登录）</Link>
       </p>
     </main>
   );

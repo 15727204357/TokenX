@@ -141,9 +141,10 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | POST | `/auth/register` | 注册 | F1 |
 | POST | `/auth/login` | 登录 | F1 |
 | GET | `/users/me` | 当前用户 | F1 |
-| GET | `/products` | 套餐分页列表 | F2 |
-| GET | `/products/{id}` | 套餐详情 | F2 |
-| POST | `/admin/products` | 新增套餐（管理员） | F2 |
+| GET | `/products` | 套餐分页列表（仅 `ON_SALE`，游标 `cursor` + `limit`） | F2 |
+| GET | `/products/{id}` | 套餐详情（仅 `ON_SALE`；不存在与已下架同为 `404 PRODUCT_NOT_FOUND`） | F2 |
+| POST | `/admin/products` | 新增套餐（管理员；默认 `OFF_SHELF`） | F2 |
+| PATCH | `/admin/products/{id}/status` | 套餐上架/下架（管理员；重复同一状态幂等成功） | F2 |
 | POST | `/admin/activities` | 创建秒杀活动 | F3 |
 | GET | `/activities/{id}` | 活动详情、状态和库存展示 | F3 |
 | POST | `/activities/{id}/orders` | 下单；Header `Idempotency-Key` | F4 |
@@ -156,6 +157,8 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | GET | `/order-requests/{requestId}` | 查询异步请求最终结果 | F9 |
 
 认证：`Authorization: Bearer <JWT>`；用户身份从认证上下文取，不允许从请求体传 `userId` 来决定交易归属。活动时间、库存、价格等由服务端决定。
+
+匿名可访问的只有：健康检查、`/auth/**`、`GET /products/**`。`/admin/**` 一律要求 `ROLE_ADMIN`（未登录 401，普通用户 403），角色只来自已验签的 JWT claim。
 
 ### 状态码约定
 

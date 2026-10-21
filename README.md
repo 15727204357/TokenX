@@ -2,9 +2,10 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3` 与 `F1` 完成——最小可运行骨架、MySQL 迁移链路、Redis 连通性、
-> 数据库/高并发设计基线，以及注册、登录、JWT 鉴权、`/users/me` 和最小 React 登录页。
-> 套餐、活动、订单、支付与钱包接口尚未实现。
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2` 完成——最小可运行骨架、MySQL 迁移链路、Redis 连通性、
+> 数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，以及 Token 套餐目录
+> （管理员创建/上下架、游客游标分页列表与详情、公开列表页）。
+> 秒杀活动、订单、支付与钱包接口尚未实现。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -78,7 +79,8 @@ Actuator 健康端点（运维用）：`http://localhost:8080/actuator/health`
 
 ## 认证接口（F1）
 
-前缀 `/api/v1`，除健康检查与 `/auth/**` 外全部需要 `Authorization: Bearer <JWT>`。
+前缀 `/api/v1`。匿名可访问：健康检查、`/auth/**`、以及 `GET /products/**`（见下一节）；其余接口都需要
+`Authorization: Bearer <JWT>`。
 
 | 方法 | 路径 | 说明 | 成功 | 主要失败 |
 |---|---|---|---|---|
@@ -107,6 +109,54 @@ curl -s http://localhost:8080/api/v1/users/me -H "Authorization: Bearer $TOKEN"
 - JWT 在本地验签，**每个已认证请求都不查 `app_user`**；因此禁用用户的存量 Token 最迟在过期时失效。
 - 所有错误统一为 `{code, message, requestId}`，响应头带 `X-Request-Id`。
 
+## 套餐接口（F2）
+
+公开读取允许游客访问，写入只允许管理员。列表用**游标分页**（`id < cursor`，`id DESC`），不用
+`OFFSET`，所以翻到深处不会越来越慢，也不会因数据变动出现重复或漏项。
+
+| 方法 | 路径 | 说明 | 成功 | 主要失败 |
+|---|---|---|---|---|
+| GET | `/products?cursor=&limit=` | 在售套餐列表，`limit` 默认 20、上限 100 | `200` `{items, nextCursor, hasMore}` | `400 VALIDATION_FAILED` |
+| GET | `/products/{id}` | 在售套餐详情 | `200` `{id, name, creditAmount, listPriceCent, status}` | `404 PRODUCT_NOT_FOUND`（不存在**或**已下架，响应完全一致） |
+| POST | `/admin/products` | 创建套餐（管理员），请求体只接受 `name`/`creditAmount`/`listPriceCent` | `201`，状态固定为 `OFF_SHELF` | `400`、`401`、`403` |
+| PATCH | `/admin/products/{id}/status` | 上架/下架（管理员），`{"status":"ON_SALE"\|"OFF_SHELF"}` | `200`，重复同一状态也返回 `200` | `400`、`401`、`403`、`404 PRODUCT_NOT_FOUND` |
+
+```bash
+# 游客：列表与详情（无需 Token）
+curl -s 'http://localhost:8080/api/v1/products?limit=20'
+curl -s 'http://localhost:8080/api/v1/products?limit=20&cursor=42'
+curl -s http://localhost:8080/api/v1/products/1
+
+# 管理员：创建 → 上架 → 下架
+curl -s -X POST http://localhost:8080/api/v1/admin/products \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"入门包","creditAmount":1000,"listPriceCent":990}'
+
+curl -s -X PATCH http://localhost:8080/api/v1/admin/products/1/status \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"status":"ON_SALE"}'
+```
+
+要点：
+
+- 新建套餐默认 **下架**；`status` 由服务端决定，客户端传 `status` 会被忽略。上架是独立的一步。
+- 下架只改状态、**不删除记录**（后续活动与历史订单仍指向它），并且立即从公共列表与详情中消失。
+- 名称去首尾空格后必须非空且不超过 96 个字符；`creditAmount` 与 `listPriceCent` 必须是正整数，
+  金额只用整数“分”，数据库另有 `CHECK` 兜底（`> 0`、`status IN (0,1)`）。
+- 套餐名**不唯一**：同名展示套餐是合法的，不构成数据冲突。
+- `GET /products/**` 匿名可读；`/admin/**` 需要 `ROLE_ADMIN`。未登录 `401`，普通用户 `403`。
+- `nextCursor` 只在还有下一页时返回，客户端不需要（也不应该）自己推算游标。
+
+### 本地管理员（仅本地演示，人工执行）
+
+代码里**没有**默认管理员、默认密码或任何提权接口。需要管理员时，先用 `/auth/register` 注册一个
+普通账号，然后在本机数据库里手工提升角色，再**重新登录**（角色在签发的 JWT 里，旧 Token 不会变）：
+
+```sql
+-- 只允许在本地开发库执行；生产环境禁止
+UPDATE app_user SET role = 1 WHERE username = '<你的用户名>';
+```
+
 ## 前端（`frontend/`）
 
 ```bash
@@ -118,16 +168,18 @@ pnpm test
 pnpm build
 ```
 
-页面目前只有登录 / 注册并登录，进入后展示 `/users/me` 返回的当前用户。Token 存在浏览器
+页面：登录 / 注册并登录、当前用户、以及公开的套餐列表 `/products`（未登录可访问，展示名称、Token
+额度与格式化后的价格，支持“加载更多”并按服务端 `nextCursor` 续页）。Token 存在浏览器
 `localStorage`，由统一的 HTTP 拦截器附加到请求头。
 
 ## 数据库迁移
 
 - 迁移脚本位于 `src/main/resources/db/migration/`，命名 `V<版本>__<说明>.sql`。
 - 应用启动时由 Flyway 自动执行；**禁止**手工改已发布的迁移文件，也禁止用 ORM 自动建表覆盖。
-- 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（后三个属于 F1）。
+- 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
+  `V5` `token_package`（F2）。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V4 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V5 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥
@@ -145,6 +197,8 @@ src/main/java/com/tokenx/
 ├── TokenXApplication.java          启动类
 ├── auth/                           F1 身份模块：注册、登录、当前用户
 │   ├── controller/  service/  mapper/  model/  dto/
+├── catalog/                        F2 套餐模块：创建、上下架、公共列表与详情
+│   ├── controller/  service/  mapper/  model/  dto/
 └── infrastructure/                 通用基础设施（安全、异常转换、外部适配）
     ├── web/                        健康检查、统一错误、requestId
     ├── security/                   Spring Security 配置、JWT 签发与本地验签
@@ -152,12 +206,12 @@ src/main/java/com/tokenx/
 src/main/resources/
 ├── application.yml                 默认配置（无密码、无密钥）
 ├── db/migration/                   Flyway 版本化迁移
-src/test/java/com/tokenx/           与主代码镜像的测试（auth 包为 F1 集成测试）
+src/test/java/com/tokenx/           与主代码镜像的测试（auth/catalog 为真实 MySQL 集成测试）
 frontend/                           React 19 + TS + Vite 前端
 docs/                               需求、工程规范、实施计划、Git 工作流、版本锁定
 ```
 
-业务模块（`catalog`、`activity`、`order`、`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
+业务模块（`activity`、`order`、`payment`、`wallet`）按 `docs/DEVELOPMENT_PLAN.md` 的顺序逐个引入，**不预先创建空包**。
 
 ## 项目文档
 

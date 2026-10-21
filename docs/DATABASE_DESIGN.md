@@ -256,9 +256,9 @@ erDiagram
 | `status` | `TINYINT` | NO | 0 | 0=OFF_SHELF，1=ON_SALE |
 | `created_at` / `updated_at` | `DATETIME(3)` | NO | 同上 | |
 
-**键与约束**：`PRIMARY KEY(id)`；`KEY idx_package_status (status)`（列表页 `WHERE status=1 ORDER BY id DESC`，InnoDB 二级索引自带主键，无需再写 `(status,id)`）。
+**键与约束**：`PRIMARY KEY(id)`；`KEY idx_package_status (status)`（列表页 `WHERE status=1 ORDER BY id DESC`，InnoDB 二级索引自带主键，无需再写 `(status,id)`）；`CHECK` 兜底：`status IN (0,1)`、`credit_amount > 0`、`list_price_cent > 0`（应用层先校验，数据库再兜底）。`name` **不加唯一键**：同名展示套餐不是数据冲突。
 
-**查询**：`SELECT ... WHERE status=1 ORDER BY id DESC LIMIT ?` → `idx_package_status`；详情 `WHERE id=?` → 主键；管理端全量列表 → 主键扫描（表小，量级百级）。
+**查询**：公共列表 `SELECT ... WHERE status=1 AND id<? ORDER BY id DESC LIMIT ?` → `idx_package_status`（游标分页，不用 `OFFSET`）；详情 `WHERE id=? AND status=1` → 主键；管理端全量列表 → 主键扫描（表小，量级百级）。
 
 **读写与热点**：读多写少，缓存友好（F7 可做 Cache-Aside）。无并发写竞争。
 

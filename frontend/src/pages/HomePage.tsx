@@ -1,4 +1,4 @@
-import { Navigate } from 'react-router-dom';
+import { Link, Navigate } from 'react-router-dom';
 import { useAuth } from '../auth/useAuth';
 
 export function HomePage() {
@@ -25,6 +25,9 @@ export function HomePage() {
       <button type="button" onClick={signOut}>
         退出登录
       </button>
+      <p className="hint">
+        <Link to="/products">查看 Token 套餐</Link>
+      </p>
     </main>
   );
 }

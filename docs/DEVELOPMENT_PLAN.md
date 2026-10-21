@@ -58,7 +58,16 @@
 
 **验收**：有效登录可访问 `me`，未授权返回 401；`Alice`/`alice` 不能重复注册；禁用用户不能新登录；密码不明文入库；每个成功注册用户恰有一个零余额账户且任一插入失败整体回滚；JWT 热路径不逐请求查询用户表；前后端跑通；测试通过。
 
-### [ ] F2 Token 套餐
+### [x] F2 Token 套餐
+
+> 完成记录（2026-10-21，分支 `feature/F2-catalog`）：
+> 迁移 `V5__create_token_package` 已应用（`status`/`credit_amount`/`list_price_cent` 三条 CHECK + `idx_package_status`）；
+> 管理员创建套餐默认 `OFF_SHELF`，客户端传 `status` 被忽略；上下架只改状态、不删记录，重复同一状态幂等返回 200；
+> 公共列表 `WHERE status=1 AND id<? ORDER BY id DESC LIMIT ?`（游标分页、`limit` 默认 20 上限 100、
+> `limit+1` 判断下一页、不执行 `COUNT(*)`），详情只读 `ON_SALE`，不存在与已下架同为 `404 PRODUCT_NOT_FOUND`；
+> `GET /products/**` 匿名可读、`/admin/**` 需 `ROLE_ADMIN`（未登录 401、普通用户 403，角色只取自 JWT claim）。
+> `./mvnw clean verify` 74 个测试通过（真实 MySQL `tokenx_test`，含 2 个真实端口 HTTP 冒烟）；
+> 前端 `pnpm lint` / `pnpm test`(10) / `pnpm build` / `pnpm format:check` 通过。
 
 **范围**：管理员创建/上下架套餐、游客读取列表与详情；React 简单列表。不要引入缓存。
 
@@ -142,4 +151,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F2。
+> F0-1～F0-3、F1、F2 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F3。
