@@ -100,6 +100,8 @@ curl -s http://localhost:8080/api/v1/users/me -H "Authorization: Bearer $TOKEN"
 要点：
 
 - 用户名 3–64 位字母/数字/下划线，`utf8mb4_0900_ai_ci` 唯一索引保证 `Alice` 与 `alice` 是同一账号。
+- 密码至少 8 个字符，且**UTF-8 编码后不超过 72 字节**（BCrypt 的上限是字节数，不是字符数；25 个汉字即 75 字节，
+  会被校验直接拒绝并返回 `400 VALIDATION_FAILED`，而不是让编码器抛出 500）。注册与登录使用同一规则。
 - 密码 BCrypt 哈希入库，接口与日志都不出现明文；注册**不接受**客户端指定 `role`/`status`。
 - 注册在同一个事务里写 `app_user` + `token_account`（余额 0），任一步失败整体回滚。
 - JWT 在本地验签，**每个已认证请求都不查 `app_user`**；因此禁用用户的存量 Token 最迟在过期时失效。

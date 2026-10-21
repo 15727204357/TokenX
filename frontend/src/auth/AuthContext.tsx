@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { fetchMe, login, register, type User } from '../api/auth';
+import { fetchMe, login, register, type TokenResponse, type User } from '../api/auth';
 import { AuthContext, type AuthContextValue } from './context';
 import { clearToken, getToken, setToken } from './storage';
 
@@ -37,18 +37,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const signIn = useCallback(async (username: string, password: string) => {
-    const token = await login(username, password);
+  // A token only becomes a session once /users/me confirms whose token it is. If that second step
+  // fails (expired token, user disabled, server error), the token is dropped instead of being left
+  // behind: a stored credential nobody successfully used would be retried on every page load.
+  const authenticate = useCallback(async (obtainToken: () => Promise<TokenResponse>) => {
+    const token = await obtainToken();
     setToken(token.accessToken);
-    setUser(await fetchMe());
+    try {
+      setUser(await fetchMe());
+    } catch (error) {
+      clearToken();
+      setUser(null);
+      throw error;
+    }
   }, []);
 
-  const signUp = useCallback(async (username: string, password: string) => {
-    await register(username, password);
-    const token = await login(username, password);
-    setToken(token.accessToken);
-    setUser(await fetchMe());
-  }, []);
+  const signIn = useCallback(
+    (username: string, password: string) => authenticate(() => login(username, password)),
+    [authenticate],
+  );
+
+  const signUp = useCallback(
+    (username: string, password: string) =>
+      authenticate(async () => {
+        await register(username, password);
+        return login(username, password);
+      }),
+    [authenticate],
+  );
 
   const signOut = useCallback(() => {
     clearToken();

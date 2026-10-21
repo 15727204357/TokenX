@@ -48,7 +48,7 @@
 > 完成记录（2026-10-20，分支 `feature/F1-auth`）：
 > 迁移 `V2__drop_schema_probe` / `V3__create_app_user` / `V4__create_token_account` 已应用；注册在同一事务内写
 > `app_user` + 零余额 `token_account`，失败整体回滚；登录签发 HS256 JWT，鉴权全本地验签，`/users/me` 只读 claims。
-> `./mvnw clean verify` 36 个测试通过（真实 MySQL `tokenx_test`）；前端 `pnpm lint` / `pnpm test`(3) / `pnpm build` 通过。
+> `./mvnw clean verify` 45 个测试通过（真实 MySQL `tokenx_test`）；前端 `pnpm lint` / `pnpm test`(6) / `pnpm build` 通过。
 > 空库 bootstrap 用独立临时 MySQL 9.7.2 实例（端口 3307，验证后已销毁）实测：V1→V4 全部应用、二次启动
 > `No migration necessary`、历史保持 4 条；本机应用账号无 `CREATE/DROP DATABASE` 权限，故该场景不进自动化套件，
 > 复现命令：`mysqld --initialize-insecure --datadir=<tmp>/data` 启动实例后
