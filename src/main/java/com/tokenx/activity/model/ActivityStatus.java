@@ -8,7 +8,8 @@ import com.baomidou.mybatisplus.annotation.IEnum;
  * <p>This is <em>not</em> the run-time state: whether an activity is upcoming, active or ended is
  * derived from its time window and the server clock (see {@link RuntimeStatus}).
  *
- * <p>The only legal edges are the two below. {@code OFFLINE} is terminal: an activity that was
+ * <p>The only legal transitions are the three below: {@code DRAFT -> PUBLISHED}, {@code DRAFT ->
+ * OFFLINE} and {@code PUBLISHED -> OFFLINE}. {@code OFFLINE} is terminal: an activity that was
  * withdrawn or whose draft was cancelled can never be published again, and no state can go back to
  * {@code DRAFT}. Re-requesting the current state is handled by the service before this rule is
  * consulted, so it stays an idempotent success instead of a conflict.

@@ -116,8 +116,9 @@ public class ActivityService {
    * and no version column or distributed lock is involved.
    *
    * <p>Repeating the current status returns it without executing any {@code UPDATE}. Everything else
-   * that is not one of the two legal edges is a {@code 409}: {@code OFFLINE} is terminal and nothing
-   * returns to {@code DRAFT}.
+   * that is not one of the three legal transitions ({@code DRAFT -> PUBLISHED}, {@code DRAFT ->
+   * OFFLINE}, {@code PUBLISHED -> OFFLINE}) is a {@code 409}: {@code OFFLINE} is terminal and
+   * nothing returns to {@code DRAFT}.
    *
    * <p>Publishing re-reads the package: it must still be on sale, the window must not have ended
    * yet, and the credit snapshot is refreshed from the package so the published snapshot always

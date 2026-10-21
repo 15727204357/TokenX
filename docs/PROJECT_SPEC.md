@@ -119,7 +119,7 @@
 
 ### 5.4 活动状态（配置态与运行态分离）
 
-配置态 `status` 只有三个值：`DRAFT(0)`、`PUBLISHED(1)`、`OFFLINE(2)`，只允许两条边：
+配置态 `status` 只有三个值：`DRAFT(0)`、`PUBLISHED(1)`、`OFFLINE(2)`，只有三条合法迁移：
 
 ```text
 DRAFT ──发布──> PUBLISHED ──下架──> OFFLINE

@@ -64,7 +64,7 @@ PAID / CLOSED 为终态，V1 无退款，不可回退。
 ### 1.4 活动状态：配置态与运行态分离
 
 - `seckill_activity.status` 只表示**配置/发布状态**：`0=DRAFT`、`1=PUBLISHED`、`2=OFFLINE`。
-- 只允许两条边：`DRAFT → PUBLISHED`、`DRAFT → OFFLINE`、`PUBLISHED → OFFLINE`；`OFFLINE` 是终态，任何状态都不能回到 `DRAFT`。重复请求当前状态幂等成功，不算迁移。
+- 活动只有**三条合法迁移**：`DRAFT → PUBLISHED`、`DRAFT → OFFLINE`、`PUBLISHED → OFFLINE`；`OFFLINE` 是终态，任何状态都不能回到 `DRAFT`。重复请求当前状态幂等成功，不算迁移。
 - 发布前必须重新确认套餐仍为 `ON_SALE`、`end_at > 当前服务端时间`，并用套餐当前额度刷新 `credit_amount_snapshot`；发布后这三项与总库存一起冻结。
 - "未开始 / 进行中 / 已结束"是**运行态**，由 `start_at`、`end_at` 与服务端当前时间按半开区间 `[start_at, end_at)` 计算，**不落库**（落库就需要定时任务改状态，且必然与真实时间漂移）。
 - 抢购时两种状态都要校验：`status=1` 且 `now ∈ [start_at, end_at)`。
@@ -433,7 +433,10 @@ erDiagram
 
 ## 5. 关键 SQL 与事务边界
 
-> 所有事务**只包数据库操作**：不调 HTTP、不写 Kafka、不等待 Redis、不做耗时统计。所有状态迁移都用**条件 UPDATE + 检查影响行数**，不信任"先查后改"。
+> 所有事务**只包数据库操作**：不调 HTTP、不写 Kafka、不等待 Redis、不做耗时统计。状态迁移按竞争强度分两类，**不能用一句话覆盖**：
+>
+> - **订单、库存等高并发竞争路径**：用**条件 UPDATE + 检查影响行数**（`WHERE status=0`、`WHERE available_stock>0`），不信任"先查后改"。这类路径每毫秒都有竞争，先读再写既增加往返又把判断建立在可能过期的读上，条件更新让数据库在一条语句里完成"判断 + 修改"。
+> - **套餐、活动等低频管理状态**：在事务内用主键 `SELECT ... FOR UPDATE` 锁**单个主键行**，读到已提交的最新状态后再校验并更新，并发写由此串行化。管理写每天只有几次，锁竞争可以忽略；反过来，先读快照再条件更新会踩 REPEATABLE-READ 的坑（条件 UPDATE 影响 0 行后普通 SELECT 仍读旧快照）。已实现的 F2 套餐上下架与 F3 活动发布/下架属于这一类，见 §4.2/§4.3。
 
 ### 5.1 秒杀下单（A 阶段，同步 MySQL）
 
@@ -542,7 +545,8 @@ INSERT INTO token_account(user_id, available_balance) VALUES (?, 0);
 - 新订单行在插入提交前不可能被支付/关单事务锁住，因此“库存 → 插入新订单”不会与“既有订单 → 库存”形成等待环。
 - 支付与关单都先用订单条件更新取得既有订单行锁，同一订单只有一个赢家；禁止先修改库存再回头修改**既有**订单。
 - 活动/套餐发布后关键快照不可修改；`FOR SHARE` 只与极低频管理写冲突，活动之间互不影响。
-- 状态判定不先 `SELECT ... FOR UPDATE` 再更新；支付/关单用单条条件 UPDATE。超时 Worker 为领取任务使用 `FOR UPDATE SKIP LOCKED` 是明确例外。
+- 订单与库存这类**高并发路径**的状态判定不先 `SELECT ... FOR UPDATE` 再更新：支付/关单用单条条件 UPDATE 并检查影响行数。超时 Worker 为领取任务使用 `FOR UPDATE SKIP LOCKED` 是明确例外。
+- 套餐与活动这类**低频管理状态**相反：事务内 `SELECT ... FOR UPDATE` 锁单个主键行，读到最新已提交状态后再校验/更新（F2 上下架、F3 发布/下架），避免把 REPEATABLE-READ 下的旧快照当作当前状态；该锁只覆盖目标主键行，不引入版本列或分布式锁。
 - 捕获 MySQL 死锁时只能重试整个短事务，次数有上限并带抖动，同时记录指标；不能从中间 SQL 继续。
 
 ### 5.6 事务内禁止清单
