@@ -20,6 +20,14 @@ spring:
     # Tests must fail loudly instead of silently migrating the wrong database.
     clean-disabled: true
 
+tokenx:
+  order:
+    timeout:
+      # No background trigger in tests: a scheduler thread could close the very rows a test is
+      # about to assert on, at a moment the test does not control. The scan itself is fully
+      # exercised by calling OrderTimeoutService directly.
+      enabled: false
+
 logging:
   level:
     root: warn

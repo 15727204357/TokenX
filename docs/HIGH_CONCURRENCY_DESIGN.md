@@ -158,6 +158,8 @@ tokenx:seckill:{activityId}:requests
 - 新建秒杀订单的锁序是“活动配置共享锁 → 库存行 → 插入新订单”；支付与关单处理既有订单时统一“订单行 → 库存行 → 账户行 → 流水插入”。
 - 支付已按上述锁序实现（F5）：先由 `WHERE status=0 AND expires_at>now` 的条件 `UPDATE` 取得订单行锁，再依次结转库存（仅秒杀）、更新账户、插入流水。失败的一侧在订单行上只**等待**、不持锁，因此“同一订单并发支付”与“同一用户两笔订单并发支付”都不会形成等待环；失败后用 `FOR SHARE` 当前读判定原因，避免 REPEATABLE READ 旧快照把已支付判成待支付而触发第二次入账。
 - 超时关闭使用 `(status, expires_at)` 索引和 `FOR UPDATE SKIP LOCKED`，每个短事务只关闭一笔订单；多个 Worker 可并行且不会重复释放库存。
+- F6 已按上述方式实现：领取走 `WHERE status=0 AND expires_at<=? ORDER BY expires_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`，被别的 Worker 占住的行直接跳过而不是排队，因此多实例是**分摊**积压而非串行处理，也不需要 ShedLock 之类的分布式锁。单次触发处理量由 `tokenx.order.timeout.max-orders-per-run` 上界（默认 100、上限 1000），循环次数有界；某笔失败即结束本次运行（该订单仍为 `UNPAID`，同一轮重试只会反复命中同一行），由下一次触发重试。支付与关单的锁序相同（`purchase_order → activity_inventory`），且两者的时间谓词互斥（`expires_at > now` 对 `expires_at <= now`），所以不存在两个赢家，也不存在等待环。
+- 超时 Worker 只做“订单行 → 库存行”两步写，不触碰账户与流水；普通订单连库存行都不访问。因此关单不会与用户余额或账本产生锁竞争，其并发度只受限于到期订单所在的行。
 - 死锁可对整个短事务做少量带抖动重试，但必须记录指标；不能只重放事务中间一条 SQL。
 
 ## 5. 故障矩阵

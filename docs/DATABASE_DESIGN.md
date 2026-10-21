@@ -578,20 +578,62 @@ VALUES (?, 1, ?, 1, ?, ?, ?);
 **余额上限**：`available_balance` 是 `BIGINT UNSIGNED`，加法溢出会让数据库报错并使事务回滚，
 不会回绕成一个很小的余额。
 
-### 5.3 超时关闭（2 次写）
+### 5.3 超时关闭（F6 实现，每单一个短事务）
 
 ```sql
-UPDATE purchase_order
-   SET status = 2, closed_at = ?, updated_at = ?
- WHERE id = ? AND status = 0 AND expires_at <= ?;
+-- 1. 领取：跳过已被其它事务锁住的行，取最早到期的一笔（只读一次 Clock，截断到毫秒）
+SELECT id, order_no, order_type, activity_id, status, expires_at, paid_at, closed_at
+  FROM purchase_order
+ WHERE status = 0
+   AND expires_at <= ?
+ ORDER BY expires_at, id
+ LIMIT 1
+ FOR UPDATE SKIP LOCKED;
+-- 无行 = 本批已空，正常结束（不是错误）
 
+-- 2. 条件关闭：影响行数必须为 1；paid_at 不动（关闭的订单从未支付）
+UPDATE purchase_order
+   SET status = 2,
+       closed_at = ?,
+       updated_at = ?
+ WHERE id = ?
+   AND status = 0
+   AND expires_at <= ?;
+
+-- 3. 仅 SECKILL：归还预占，影响行数必须为 1（0 = 不变量破坏，整笔回滚）
 UPDATE activity_inventory
    SET reserved_stock = reserved_stock - 1,
        available_stock = available_stock + 1
- WHERE activity_id = ? AND reserved_stock > 0;
+ WHERE activity_id = ?
+   AND reserved_stock > 0;
 ```
 
-**扫描**：每个 Worker 用短事务执行 `SELECT id FROM purchase_order WHERE status=0 AND expires_at <= ? ORDER BY expires_at LIMIT 1 FOR UPDATE SKIP LOCKED`，随后在同一事务关闭该订单；循环次数与 Worker 数均有界。这样多实例不会重复领取同一行，也不会用一把大事务持有上百笔订单锁。普通订单关闭时只改订单，秒杀订单才释放预留库存。
+**为什么不只靠条件 UPDATE 的 `WHERE` 就够**：领取语句决定“处理哪一行”，条件关闭语句才是状态闸门。
+两句都带 `expires_at <= ?` 与 `status = 0`，是因为它们职责不同：前者从积压里挑一行并加锁，后者在
+修改前再确认一次该行确实仍是可关闭的。持锁期间没有并发写者能改动该行，所以关闭影响 0 行只可能是
+数据本身矛盾（例如 `status` 已被人工改过），此时抛错回滚而不是“当作已处理”。
+
+**为什么必须 `SKIP LOCKED`**：没有它，所有 Worker 会同时阻塞在同一张最早到期的订单上，队列化之后
+一次只有一个人干活，其余连接都在等锁。加了之后，被别的 Worker 占住的行直接跳过，实例之间自然分摊
+积压，且**不需要分布式锁**。`ORDER BY expires_at, id` 让“下一行”在所有 Worker 眼里都是同一个顺序，
+`idx_order_timeout(status, expires_at)`（InnoDB 二级索引隐含主键）提供有序访问，不产生 filesort。
+
+**每单一个事务**：领取 → 关闭 → 释放 → 提交，然后循环处理下一单，循环次数由
+`tokenx.order.timeout.max-orders-per-run` 限制。一次事务锁一批订单会让持锁时间与批大小成正比，且
+批次末尾失败会撤销前面已报告的结果；单事务单订单则最优情况下只丢一笔，已提交的订单保持已关闭。
+
+**失败即停止本批**：库存释放影响 0 行 → 抛错 → 事务回滚（订单仍是 `UNPAID`，`closed_at` 仍为空）。
+失败的行在下一轮仍会被领取，因此同一批里立刻重试只会反复命中同一行；`closeExpiredOrders` 捕获后
+记录 ERROR 并结束本次运行，由下一次触发重试，循环因此始终有界。
+
+**普通订单与秒杀订单**：`NORMAL` 关闭只执行第 1–2 步，完全不读不写 `activity_inventory`；`SECKILL`
+必须第 3 步影响 1 行，否则整笔回滚——“关了单却没还库存”和“还了库存但订单没关”都不允许出现。
+
+**时间与不可逆性**：`closed_at`、`updated_at` 使用该事务读取的同一个 `Clock` 值，客户端时间不参与。
+关闭不写流水、不改余额、不删除订单；`(activity_id, user_id)` 唯一约束保留，所以过期订单不会变成
+“可以再抢一次”的机会。重复扫描时该行已不满足 `status = 0`，库存不会被二次释放。
+
+**零 DDL**：F6 不新增迁移，schema 仍为 `V9`，只复用 `V8` 已有的 `idx_order_timeout(status, expires_at)`。
 
 ### 5.4 注册（F1 起固定为 2 次写）
 

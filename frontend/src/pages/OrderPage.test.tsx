@@ -30,6 +30,12 @@ const paid: OrderDetail = {
   paidAt: '2026-10-22T02:05:00Z',
 };
 
+const closed: OrderDetail = {
+  ...sample,
+  status: 'CLOSED',
+  closedAt: '2026-10-22T02:15:01Z',
+};
+
 function renderPage(orderNo = sample.orderNo) {
   return render(
     <MemoryRouter initialEntries={[`/orders/${orderNo}`]}>
@@ -167,6 +173,61 @@ describe('订单详情页', () => {
     expect(await screen.findByText('已支付')).toBeInTheDocument();
     expect(screen.getByText('2026-10-22 10:05:00')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '模拟支付' })).not.toBeInTheDocument();
+  });
+
+  it('刷新后按服务端响应变为已关闭，展示关闭时间并隐藏支付按钮', async () => {
+    vi.mocked(fetchOrder).mockResolvedValueOnce(sample).mockResolvedValueOnce(closed);
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '刷新订单状态' }));
+
+    expect(await screen.findByText('已关闭')).toBeInTheDocument();
+    expect(screen.getByText('2026-10-22 10:15:01')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '模拟支付' })).not.toBeInTheDocument();
+    expect(fetchOrder).toHaveBeenCalledTimes(2);
+  });
+
+  it('刷新进行中禁用按钮，连续点击只刷新一次', async () => {
+    let finishRefresh!: (value: OrderDetail) => void;
+    vi.mocked(fetchOrder)
+      .mockResolvedValueOnce(sample)
+      .mockReturnValueOnce(
+        new Promise<OrderDetail>((resolve) => {
+          finishRefresh = resolve;
+        }),
+      );
+
+    renderPage();
+
+    const button = await screen.findByRole('button', { name: '刷新订单状态' });
+    await userEvent.click(button);
+    await userEvent.click(button);
+
+    expect(fetchOrder).toHaveBeenCalledTimes(2);
+    const pending = screen.getByRole('button', { name: '正在刷新…' });
+    expect(pending).toBeDisabled();
+    expect(pending).toHaveAttribute('aria-busy', 'true');
+
+    finishRefresh(closed);
+
+    expect(await screen.findByText('已关闭')).toBeInTheDocument();
+    expect(fetchOrder).toHaveBeenCalledTimes(2);
+  });
+
+  it('刷新失败时保留原订单，不把本地状态改成已关闭', async () => {
+    vi.mocked(fetchOrder)
+      .mockResolvedValueOnce(sample)
+      .mockRejectedValueOnce(new ApiError(500, 'INTERNAL_ERROR', 'unexpected server error'));
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '刷新订单状态' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('刷新失败，请稍后重试');
+    expect(screen.getByText('待支付')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '模拟支付' })).toBeInTheDocument();
+    expect(screen.queryByText('已关闭')).not.toBeInTheDocument();
   });
 
   it('已关闭的订单没有支付按钮', async () => {

@@ -59,4 +59,29 @@ public interface ActivityInventoryMapper extends BaseMapper<ActivityInventory> {
          AND reserved_stock > 0
       """)
   int settleReserved(@Param("activityId") long activityId);
+
+  /**
+   * Returns one reservation to the shelf: the unit leaves {@code reserved_stock} and becomes
+   * available again.
+   *
+   * <p>This is the mirror image of {@link #reserveOne} and belongs to closing an expired order, where
+   * the sale never happened. {@link #settleReserved} is the opposite outcome — the sale happened and
+   * the unit is merely no longer available — so the two statements are never alternatives for the
+   * same order: payment and closure each own exactly one of them, and the order row decides which.
+   *
+   * <p>{@code reserved_stock > 0} keeps the unsigned column from wrapping and doubles as the
+   * invariant check: {@code 1} means a reservation existed and was returned, {@code 0} means the
+   * order claimed a reservation the activity does not have. The caller must treat that as corruption
+   * and roll the closure back, otherwise the order would end {@code CLOSED} with its unit neither
+   * reserved nor sold.
+   */
+  @Update(
+      """
+      UPDATE activity_inventory
+         SET reserved_stock = reserved_stock - 1,
+             available_stock = available_stock + 1
+       WHERE activity_id = #{activityId}
+         AND reserved_stock > 0
+      """)
+  int releaseReserved(@Param("activityId") long activityId);
 }

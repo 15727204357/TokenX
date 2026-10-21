@@ -2,15 +2,16 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5` 完成——最小可运行骨架、MySQL 迁移链路、
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5`、`F6` 完成——最小可运行骨架、MySQL 迁移链路、
 > Redis 连通性、数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
 > （管理员创建/上下架、游客游标分页列表与详情、公开列表页），秒杀活动配置与库存初始化
 > （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），**同步秒杀下单**
 > （MySQL 条件扣库存 + 唯一键一人一单 + 幂等键重放、订单详情页），**普通购买下单**
 > （按套餐标价直接下单，不碰活动库存、无一人一单限制，与秒杀共用订单表、查询与后续状态机），
-> 以及**模拟支付与钱包**（同一事务内订单转 `PAID` + 秒杀预占结转 + 余额入账 + 不可变流水，
-> 重复/并发支付只入账一次，余额与流水分页查询，订单页支付按钮与钱包页）。
-> 订单超时关闭与库存释放在 F6，Redis/Kafka 优化在 F7 及以后。
+> **模拟支付与钱包**（同一事务内订单转 `PAID` + 秒杀预占结转 + 余额入账 + 不可变流水，
+> 重复/并发支付只入账一次，余额与流水分页查询，订单页支付按钮与钱包页），以及**订单超时关闭**
+> （`FOR UPDATE SKIP LOCKED` 有界领取、每单一个短事务、秒杀预占归还可用库存、支付与关单只能有一个赢家）。
+> Redis/Kafka 优化在 F7 及以后。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -345,7 +346,8 @@ curl -s "http://localhost:8080/api/v1/wallet/ledger?limit=20" -H "Authorization:
 - **普通订单与秒杀订单的唯一差别是库存**：`SECKILL` 只把 `reserved_stock` 减 1，`available_stock`
   不动（已售量仍由 `total-available-reserved` 派生）；`NORMAL` 完全不读也不写 `activity_inventory`。
 - **过期与关单**：`UNPAID` 且 `expires_at <= now` 返回 `409 ORDER_STATE_CONFLICT`，**不入账、不释放
-  库存**；把订单迁移为 `CLOSED` 并归还预占是 F6 的事。已 `CLOSED` 同样 `409` 且零副作用。
+  库存**；迁移为 `CLOSED` 并归还预占的是 F6 的超时扫描，与支付共用同一条订单行锁，因此两者只会有一个
+  赢家（见下一节）。已 `CLOSED` 同样 `409` 且零副作用。
 - **客户端说了不算**：`credit_amount`、`pay_amount_cent` 来自下单时的快照，`userId` 来自已验签 JWT；
   请求体即使带 `userId`/`creditAmount`/`status`/`paidAt` 也不会被采纳（该接口根本没有请求体参数）。
 - **账户不懒创建**：注册时与用户同事务建账户（Q8）。账户缺失属于不变量破坏，整笔回滚并报错，
@@ -358,6 +360,40 @@ curl -s "http://localhost:8080/api/v1/wallet/ledger?limit=20" -H "Authorization:
   `orderNo`、`effectType=CREDIT`、`delta`、`balanceAfter`、`createdAt`——内部订单 `id`、`user_id`
   与他人流水都不会出现。
 - F5 的并发/回滚测试同样只验证**正确性**（只入账一次、只结转一次、失败四张表原样），不是压测数据。
+
+## 订单超时关闭（F6）
+
+超时关闭**没有公开 API**：没有“用户取消订单”、没有“管理员强制关单”。它只能由服务端后台触发，
+客户端能做的只有重新查询订单（`GET /orders/{orderNo}`）。
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `tokenx.order.timeout.enabled` | `true` | 是否启用后台触发；测试环境为 `false` |
+| `tokenx.order.timeout.interval` | `30s` | 两次触发的间隔（`fixedDelay`，从上次结束算起）；必须为正 |
+| `tokenx.order.timeout.max-orders-per-run` | `100` | 单次触发最多关闭多少单；必须为 `1..1000` |
+
+非法配置**启动失败**（间隔非正、批量非正或超过上限），不静默修正。
+
+要点：
+
+- **边界唯一**：支付要求 `expires_at > now`，关单要求 `expires_at <= now`。两个谓词在任何时刻最多
+  只有一个成立，所以“已支付被关闭”“已关闭又入账”在状态层面就不可能发生。
+- **每单一个短事务**：领取 → 关单 → 释放库存 → 提交，循环处理下一单。没有任何“一次锁一批”的做法，
+  失败时只会丢一笔，已提交的订单不会因为后面的失败而回滚。
+- **`FOR UPDATE SKIP LOCKED` 领取**：`WHERE status=0 AND expires_at<=? ORDER BY expires_at,id LIMIT 1
+  FOR UPDATE SKIP LOCKED`。别的 Worker 正在处理的订单会被**跳过**而不是排队等待，因此多实例可以
+  并行分摊积压；`idx_order_timeout(status, expires_at)` 提供有序访问，不产生 filesort。
+- **条件更新是闸门**：`UPDATE purchase_order SET status=2, closed_at=?, updated_at=? WHERE id=?
+  AND status=0 AND expires_at<=?`，影响 0 行即视为不变量破坏并整笔回滚；`paid_at` 保持 `NULL`。
+- **普通订单只改订单**：`NORMAL` 完全不读不写 `activity_inventory`。
+- **秒杀订单同事务归还预占**：`reserved_stock-1, available_stock+1 WHERE reserved_stock>0`，影响 0 行
+  说明订单声称持有并不存在的预占，抛错回滚——绝不允许“关了单但库存没还”。
+- **重复执行安全**：已 `CLOSED` 的订单不再满足 `status=0`，重复扫描不会二次释放库存。
+- **锁序与支付一致**：`purchase_order → activity_inventory`，所以支付与关单不会形成等待环。
+- **单笔失败结束本次运行**：失败的订单会原样留在 `UNPAID`，若在同一轮里立刻重试就会反复领取同一行；
+  因此本次运行停止并记录 ERROR，下一次触发再试（由间隔兜底，不会形成紧循环）。
+- F6 **零 DDL**：没有 V10，schema 仍为 V9，复用 `V8` 的 `idx_order_timeout(status, expires_at)`。
+- F6 的测试同样只证明**正确性**（只关一次、只还一次、失败无半完成状态），不是压测数据。
 
 ## 前端（`frontend/`）
 
@@ -381,6 +417,11 @@ pnpm build
 支付成功后**用服务端返回的订单**替换本地状态，因此立即变成“已支付”并出现支付时间。`PAID` 与
 `CLOSED` 没有支付按钮。`404`（订单不存在或属于他人）、`409`（已过期/已关闭）与网络失败各给出一句
 明确提示；页面不显示倒计时，也不拿浏览器时间判断是否到期——那是服务端的判断。
+
+订单页还有“刷新订单状态”：重新请求 `GET /orders/{orderNo}`，用返回的订单替换页面状态，因此超时
+扫描把订单改为 `CLOSED` 后，点一下就能看到“已关闭”和关闭时间。刷新期间按钮禁用，重复点击只发一次
+请求；**刷新失败只显示错误，不会把本地状态改成关闭**。没有自动轮询，也没有倒计时——为一个展示
+功能制造持续 QPS 不值得。
 
 钱包页需要登录，未登录直接跳 `/login`；余额与流水都来自服务端，页面不做本地累加。流水按服务端
 `nextCursor` 续页，失败时可重试；“加载更多”失败只影响追加，不会清掉已经显示的记录。
@@ -406,7 +447,8 @@ pnpm build
   `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
   `activity_inventory`（F3）、`V8` `purchase_order`（F4）、`V9` `token_ledger`（F5，当前版本）。
 - **F4.5 没有新增迁移**：普通购买复用 `V8` 已建好的 `order_type` / 可空 `activity_id` /
-  `ck_order_activity`。
+  `ck_order_activity`。**F6 同样没有新增迁移**：超时关闭只复用 `V8` 的
+  `idx_order_timeout(status, expires_at)`，schema 版本仍是 `V9`。
 - **V9 只建 `token_ledger`**：`uk_ledger_biz(biz_type,biz_id,effect_type)` 是重复入账的第二道防线，
   `idx_ledger_user(user_id)` 服务按用户降序游标翻页；3 条 CHECK 固定业务/效果枚举并要求
   `delta` 的符号与 `effect_type` 一致（0 变动不接受）。V1–V8/V5.1 一个字都没改。
@@ -423,6 +465,9 @@ pnpm build
 - `tokenx.auth.jwt.secret` 少于 32 字符时应用启动失败：这是有意的，避免用弱密钥或空密钥上线。
 - `tokenx.order.payment-timeout`（默认 `15m`）必须为正且不超过 `24h`，否则应用启动失败：
   “永不过期”的订单比启动失败更糟。该值在创建订单时固化进 `expires_at`。
+- `tokenx.order.timeout.*` 控制超时扫描：`interval` 必须为正、`max-orders-per-run` 必须在
+  `1..1000`，否则应用启动失败；测试环境通过 `application-test.yml` 把 `enabled` 设为 `false`，
+  避免后台线程改动测试正在断言的订单。
 - JWT Secret、数据库账号密码等只能通过本地配置/环境变量提供，禁止提交到 Git。
 
 ## 目录结构
@@ -438,6 +483,7 @@ src/main/java/com/tokenx/
 │   ├── controller/  service/  mapper/  model/  dto/
 ├── order/                          F4/F4.5 订单模块：秒杀下单、普通购买、幂等键、订单查询
 │   ├── controller/  service/  mapper/  model/  dto/  support/  config/
+│   └── timeout/                    F6 超时关闭：有界扫描 + 每单一个短事务 + 调度触发
 ├── payment/                        F5 模拟支付：状态闸门、库存结转、入账事务
 │   ├── controller/  service/
 ├── wallet/                         F5 钱包：余额查询、不可变流水与游标分页

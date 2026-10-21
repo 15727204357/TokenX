@@ -140,4 +140,61 @@ public interface PurchaseOrderMapper extends BaseMapper<PurchaseOrder> {
       """)
   PurchaseOrder selectByOrderNoAndUserForShare(
       @Param("orderNo") String orderNo, @Param("userId") long userId);
+
+  /**
+   * Claims the oldest expired unpaid order for this transaction, or nothing.
+   *
+   * <p>{@code FOR UPDATE SKIP LOCKED} is what lets several workers share one backlog: a row another
+   * transaction already holds is stepped over instead of waited for, so instances do not queue behind
+   * each other and a slow transaction cannot stall the whole scan. Without {@code SKIP LOCKED} every
+   * worker would wake on the same first row and the rest of the backlog would be idle work.
+   *
+   * <p>The order of the scan is {@code (expires_at, id)}: oldest deadline first, ties broken by
+   * insertion order so two workers cannot disagree about which row is next. Both columns are in
+   * {@code idx_order_timeout(status, expires_at)} (InnoDB appends the primary key), so the scan reads
+   * the index in order and stops at one row.
+   *
+   * <p>{@code expires_at <= now} is the exact boundary: an order is closeable from the deadline
+   * itself, and payable only while strictly before it. The two predicates therefore never both hold.
+   *
+   * <p>Taking this lock is also what orders closure against payment: both paths lock the order row
+   * first and only then touch stock, so the second one to arrive sees a decided row.
+   */
+  @Select(
+      """
+      SELECT id, order_no, request_id, user_id, package_id, activity_id, order_type,
+             package_name_snapshot, credit_amount, pay_amount_cent, status,
+             expires_at, paid_at, closed_at, created_at, updated_at
+      FROM purchase_order
+      WHERE status = 0
+        AND expires_at <= #{now}
+      ORDER BY expires_at, id
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+      """)
+  PurchaseOrder selectNextExpiredForUpdateSkipLocked(@Param("now") LocalDateTime now);
+
+  /**
+   * Moves one unpaid, already expired order to {@code CLOSED}, or changes nothing at all.
+   *
+   * <p>The conditions repeat what the claim already established. That is deliberate: the claim
+   * chooses <em>which</em> row to work on, while this statement is the state gate — if the row is no
+   * longer unpaid or no longer expired, the answer is {@code 0} and the caller must stop rather than
+   * force a closure. It is the same shape as payment's gate, with the opposite deadline comparison,
+   * which is why only one of the two can ever report an affected row.
+   *
+   * <p>{@code paid_at} is not mentioned: a closed order was never paid, and touching the column
+   * would turn "never paid" into an assertion this statement cannot support.
+   */
+  @Update(
+      """
+      UPDATE purchase_order
+         SET status = 2,
+             closed_at = #{now},
+             updated_at = #{now}
+       WHERE id = #{orderId}
+         AND status = 0
+         AND expires_at <= #{now}
+      """)
+  int markClosed(@Param("orderId") long orderId, @Param("now") LocalDateTime now);
 }

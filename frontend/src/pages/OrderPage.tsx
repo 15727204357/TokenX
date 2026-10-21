@@ -38,18 +38,44 @@ function paymentMessage(error: unknown): string {
 }
 
 /**
+ * Why a refresh found nothing newer, in words the buyer can act on.
+ *
+ * <p>The page does not guess a state from a failure: whatever the error says, the order already on
+ * screen stays exactly as the server last reported it.
+ */
+function refreshMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    switch (error.code) {
+      case 'ORDER_NOT_FOUND':
+        return '订单不存在或无权查看';
+      case 'UNAUTHORIZED':
+        return '登录状态已失效，请重新登录';
+      case 'NETWORK_ERROR':
+        return '网络异常，未能取得最新状态，请重试';
+      default:
+        return '刷新失败，请稍后重试';
+    }
+  }
+  return '刷新失败，请稍后重试';
+}
+
+/**
  * Order detail, with the simulated payment action.
  *
  * <p>Everything on this page comes from the order the server stored: the amounts are the snapshots
  * taken at creation time, the status is the server's state, and the deadline is the instant the
  * server fixed. Nothing is recomputed from the browser clock — in particular the page never decides
  * on its own that an order has expired, because the server is the only authority on that and would
- * answer `409`.
+ * answer `409`. An expired order becomes `CLOSED` when the server's timeout scan runs, so the way to
+ * see that is to ask the server again, which is what the refresh action does.
  *
  * <p>The payment button exists only for `UNPAID`. While a request is in flight it is disabled, so a
  * double click cannot become two calls; and when the server answers, the returned order — not an
  * assumption — becomes the state this page renders. `PAID` and `CLOSED` therefore never offer a
  * button, without any extra rule.
+ *
+ * <p>There is no polling and no countdown: a refresh happens when the buyer asks for one, and a
+ * failed refresh keeps the previous order rather than inventing a closed one.
  *
  * <p>A missing order and another buyer's order are the same `404` by design, so there is no
  * "permission denied" branch to leak the difference.
@@ -65,6 +91,8 @@ export function OrderPage() {
   const [paying, setPaying] = useState(false);
   const [payError, setPayError] = useState<string | null>(null);
   const [paidNotice, setPaidNotice] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!orderNo) {
@@ -126,6 +154,29 @@ export function OrderPage() {
       setPayError(paymentMessage(cause));
     } finally {
       setPaying(false);
+    }
+  }
+
+  async function refresh() {
+    if (!order || refreshing || paying) {
+      // A second click while one request is in flight would only re-read the same row.
+      return;
+    }
+
+    setRefreshing(true);
+    setRefreshError(null);
+
+    try {
+      const latest = await fetchOrder(order.orderNo);
+      // The response is the state: if the timeout scan has closed the order since it was loaded,
+      // this is where the page learns it, and the badge and closedAt follow from that object.
+      setOrder(latest);
+      setPaidNotice(null);
+      setPayError(null);
+    } catch (cause) {
+      setRefreshError(refreshMessage(cause));
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -198,12 +249,26 @@ export function OrderPage() {
             ) : null}
           </dl>
 
-          {order.status === 'UNPAID' ? (
-            <div className="actions">
+          <div className="actions">
+            {order.status === 'UNPAID' ? (
               <button type="button" onClick={() => void pay()} disabled={paying} aria-busy={paying}>
                 {paying ? '正在支付…' : '模拟支付'}
               </button>
-            </div>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => void refresh()}
+              disabled={refreshing || paying}
+              aria-busy={refreshing}
+            >
+              {refreshing ? '正在刷新…' : '刷新订单状态'}
+            </button>
+          </div>
+
+          {refreshError ? (
+            <p className="error" role="alert">
+              {refreshError}
+            </p>
           ) : null}
 
           {payError ? (

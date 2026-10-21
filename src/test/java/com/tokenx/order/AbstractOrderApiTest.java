@@ -18,6 +18,7 @@ import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
 import com.tokenx.order.mapper.PurchaseOrderMapper;
 import com.tokenx.order.model.PurchaseOrder;
+import com.tokenx.order.timeout.OrderTimeoutService;
 import com.tokenx.wallet.mapper.TokenLedgerMapper;
 import com.tokenx.wallet.model.LedgerBizType;
 import com.tokenx.wallet.model.LedgerEffectType;
@@ -84,6 +85,7 @@ public abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   @Autowired protected ActivityInventoryMapper inventoryMapper;
   @Autowired protected PurchaseOrderMapper orderMapper;
   @Autowired protected TokenLedgerMapper ledgerMapper;
+  @Autowired protected OrderTimeoutService timeoutService;
   @Autowired protected PasswordEncoder passwordEncoder;
 
   private final List<Long> activityIds = new ArrayList<>();
@@ -412,6 +414,16 @@ public abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   /** The order row behind a number owned by this user, for asserting the stored state. */
   protected PurchaseOrder storedOrder(String orderNo, long userId) {
     return orderMapper.selectByOrderNoAndUser(orderNo, userId);
+  }
+
+  /**
+   * The deadline an order froze at creation time.
+   *
+   * <p>Tests move the clock to this instant instead of waiting, so "expired" is a decision about the
+   * clock rather than about how long the suite has been running.
+   */
+  protected Instant expiresAtOf(String orderNo, long userId) {
+    return storedOrder(orderNo, userId).getExpiresInstant();
   }
 
   protected String body(MvcResult result) throws Exception {

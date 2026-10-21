@@ -195,7 +195,29 @@
 
 **验收**：同一订单重复触发支付只入账一次；未登录不能支付他人订单；不允许客户端指定订单价格/到账 Token 数；MySQL 流水与余额一致；全链路演示成功。
 
-### [ ] F6 订单超时关闭与释放库存
+### [x] F6 订单超时关闭与释放库存
+
+> 完成记录（2026-10-21，分支 `feature/F6-order-timeout`）：
+> **零 DDL**：无新迁移，Flyway 仍停在 `V9`，复用 `V8` 的 `idx_order_timeout(status, expires_at)`。
+> 新增 `order/timeout/`：`OrderTimeoutService`（关单能力）、`OrderTimeoutScheduler`（`@Scheduled`
+> 触发，`enabled=false` 时整个 Bean 不存在）、`OrderTimeoutConfig`（`@EnableScheduling`）；
+> 只给既有 Mapper 加三条 SQL：`selectNextExpiredForUpdateSkipLocked`、`markClosed`、`releaseReserved`。
+> 领取：`WHERE status=0 AND expires_at<=? ORDER BY expires_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`
+> （被他人锁住的行跳过而非等待）；关闭：`UPDATE … SET status=2, closed_at=?, updated_at=?
+> WHERE id=? AND status=0 AND expires_at<=?`，影响 0 行抛错；秒杀订单同事务
+> `reserved_stock-1, available_stock+1 WHERE reserved_stock>0`，影响 0 行整笔回滚。
+> **每单一个 `TransactionTemplate` 事务**（领取→关闭→释放→提交→下一单），批量上界由
+> `tokenx.order.timeout.max-orders-per-run`（默认 100、上限 1000）控制；单笔失败记录 ERROR 并结束
+> 本次运行，避免在同一行上紧循环。支付与关单锁序统一为 `purchase_order → activity_inventory`，
+> 时间谓词 `expires_at > now` 与 `expires_at <= now` 互斥，因此只有一个赢家。
+> 普通订单只改订单（不读不写库存），`paid_at` 保持 `NULL`，不写流水、不改余额、不删订单。
+> 测试环境 `tokenx.order.timeout.enabled=false`，集成测试直接调用关单能力并用可控 `Clock` 推进时间。
+> `./mvnw clean verify` **248 个测试通过**（新增 16 个，真实 MySQL `tokenx_test`：普通/秒杀关闭、
+> `expiresAt-1ms` 不关/精确时刻关、未到期、已支付不关、重复扫描只释放一次、混合渠道、
+> 有界批处理与续航、`SKIP LOCKED` 真实阻塞验证（临时去掉 `SKIP LOCKED` 该用例会挂住）、
+> 3 Worker 并发分摊、支付/关单在两个边界上的竞争、预留缺失时的整笔回滚与批量停止、测试环境调度关闭）。
+> 前端 `pnpm lint` / `test`(**53**) / `build` / `format:check` 通过：订单页新增“刷新订单状态”，
+> 只按服务端响应更新状态，刷新中禁用、失败不改本地状态。
 
 **范围**：超时订单 `UNPAID → CLOSED`；仅秒杀订单释放预留库存；本地调度器按 `(status,expires_at)` 扫描，使用 `FOR UPDATE SKIP LOCKED` 和单订单短事务支持多 Worker；页面更新状态。
 
@@ -245,4 +267,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F6。
+> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5、F6 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F7。

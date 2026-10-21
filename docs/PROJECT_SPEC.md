@@ -225,7 +225,7 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - **库存差异**：`SECKILL` 订单只把 `reserved_stock` 减 1，`available_stock` 不动（已售量仍由
   `total - available - reserved` 派生）；`NORMAL` 订单**完全跳过**库存读写。
 - **过期语义**：`UNPAID` 且 `expiresAt <= now` 返回 `409 ORDER_STATE_CONFLICT`，不入账、不释放库存；
-  把它迁移为 `CLOSED` 并归还预占属于 F6。已 `CLOSED` 同样 `409` 且无任何副作用。
+  迁移为 `CLOSED` 并归还预占由 F6 的超时扫描完成（见 §7.4）。已 `CLOSED` 同样 `409` 且无任何副作用。
 - **可信数据只来自订单快照与 JWT**：请求体（即使带金额、额度、`userId`、状态、支付时间）不参与任何
   计算；支付金额与到账额度取自下单时写入的 `credit_amount`。
 - **账户不懒创建**：账户缺失属于不变量破坏，整笔回滚并报错；支付路径不补建账户。
@@ -237,6 +237,30 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - **`orderNo` 的关联必须校验归属**：流水只存 `biz_id`（订单内部 `id`）且无物理外键，因此取单号的
   join 条件同时包含 `o.id = l.biz_id` 与 `o.user_id = l.user_id`。`biz_id` 若指向他人订单，该条流水
   **仍返回**（隐藏它会连带隐藏余额差异），但 `orderNo` 为 `null`，绝不返回他人的订单号。
+
+### 7.4 订单超时关闭语义（F6）
+
+- **没有公开接口**：不提供用户取消、管理员强制关单或任何“立即关单”端点。关闭只由服务端后台扫描触发，
+  客户端只能通过 `GET /orders/{orderNo}` 重新读取结果。
+- **状态机只有两条边**：`UNPAID → PAID`、`UNPAID → CLOSED`，`PAID` 与 `CLOSED` 均为终态；不引入
+  `CLOSING`/`EXPIRED`/`CANCELLED` 等中间态。
+- **边界互斥**：支付要求 `expires_at > now`，关单要求 `expires_at <= now`。任何时刻最多一个谓词成立，
+  所以不存在“两边都成功”的时间点；两条路径都先取得订单行锁，后到的一方看到的是已决状态。
+- **领取用 `FOR UPDATE SKIP LOCKED`**：`WHERE status=0 AND expires_at<=? ORDER BY expires_at,id
+  LIMIT 1 FOR UPDATE SKIP LOCKED`。其他 Worker 正在处理的行被跳过而不是等待，多实例可并行分摊积压；
+  不引入分布式锁、Quartz、XXL-JOB 或 ShedLock。
+- **每单一个短事务**：领取 → 条件 `UPDATE … WHERE id=? AND status=0 AND expires_at<=?`（影响 0 行即
+  不变量破坏）→ 秒杀订单同事务归还预占 → 提交 → 下一单。禁止“一次事务锁一批”。
+- **普通订单只改订单**：`NORMAL` 不读不写 `activity_inventory`。秒杀订单执行
+  `reserved_stock-1, available_stock+1 WHERE reserved_stock>0`，影响 0 行抛错并整笔回滚。
+- **关闭不产生钱**：`paid_at` 保持 `NULL`，不写流水、不改余额；订单不删除，`(activity_id,user_id)`
+  唯一约束保留，因此过期后不能靠重新下单绕过一人一单。
+- **时间**：`closed_at` 与 `updated_at` 取该笔关单事务读取的同一个 UTC `Clock` 值（毫秒），
+  客户端时间不参与。
+- **有界批量**：单次触发最多处理 `tokenx.order.timeout.max-orders-per-run`（默认 100，上限 1000）；
+  单笔失败立即结束本次运行并记录 ERROR（失败订单仍为 `UNPAID`，同一轮重试会再次领取同一行），
+  下次触发再试。
+- **零 DDL**：不新增迁移，复用 `V8` 的 `idx_order_timeout(status, expires_at)`，schema 仍为 `V9`。
 
 ## 8. 运行时拓扑（V1）
 
