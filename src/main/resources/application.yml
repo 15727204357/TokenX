@@ -64,8 +64,9 @@ tokenx:
       enabled: ${TOKENX_ORDER_TIMEOUT_ENABLED:true}
       # Delay between two runs, measured from the end of the previous one. Must be positive.
       interval: ${TOKENX_ORDER_TIMEOUT_INTERVAL:30s}
-      # Orders one run may close. Bounded on purpose: each order is its own transaction, and an
-      # unbounded batch would hold locks for an unbounded time. Must be 1..1000.
+      # Order claims one run may make, failed attempts included: a budget of attempts, not a count
+      # of closures. Bounded on purpose: each order is its own transaction, and an unbounded batch
+      # would hold locks for an unbounded time. Must be 1..1000.
       max-orders-per-run: ${TOKENX_ORDER_TIMEOUT_MAX_ORDERS_PER_RUN:100}
 
 server:

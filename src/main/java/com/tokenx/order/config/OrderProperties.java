@@ -62,13 +62,18 @@ public record OrderProperties(Duration paymentTimeout, Timeout timeout) {
    * themselves; a scheduler thread that fires during a test would close the same rows the test is
    * about to assert on. Production leaves it on.
    *
-   * <p>{@code max-orders-per-run} bounds one trigger. A backlog is worked down over several triggers
-   * rather than by one statement that touches every expired row: the scan holds a row lock while it
-   * works, so an unbounded batch would hold one for an unbounded time.
+   * <p>{@code max-orders-per-run} is a budget of claims, not a count of closures: one trigger may
+   * <em>attempt</em> at most this many orders, and a failed attempt spends one. Without that
+   * rule, a loop stepping over a row that refuses to close would have no bound of its own, so
+   * the number of orders actually closed can be smaller than the configured value. A backlog is
+   * still worked down over several triggers rather than by one statement that touches every
+   * expired row: the scan holds a row lock while it works, so an unbounded batch would hold one
+   * for an unbounded time.
    *
    * @param enabled whether the scheduled trigger runs; default {@code true}
    * @param interval delay between two triggers, default 30 seconds
-   * @param maxOrdersPerRun orders one trigger may close, default 100, at most 1000
+   * @param maxOrdersPerRun order claims/attempts one trigger may make, including failed attempts;
+   *     default 100, at most 1000
    */
   public record Timeout(Boolean enabled, Duration interval, Integer maxOrdersPerRun) {
 
@@ -77,9 +82,9 @@ public record OrderProperties(Duration paymentTimeout, Timeout timeout) {
     public static final int DEFAULT_MAX_ORDERS_PER_RUN = 100;
 
     /**
-     * Upper bound for one trigger. Each order is its own transaction, so this is a bound on how long
-     * a trigger can occupy the scheduler thread and how much work one instance does before another
-     * instance gets a turn — not a limit on throughput.
+     * Upper bound for one trigger's claim budget. Each attempt is its own transaction, so this caps
+     * how long a trigger can occupy the scheduler thread and how much work one instance does before
+     * another instance gets a turn — not a limit on throughput.
      */
     public static final int MAX_ORDERS_PER_RUN = 1000;
 
