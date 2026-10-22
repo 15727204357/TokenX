@@ -158,7 +158,10 @@ tokenx:seckill:{activityId}:requests
 - 新建秒杀订单的锁序是“活动配置共享锁 → 库存行 → 插入新订单”；支付与关单处理既有订单时统一“订单行 → 库存行 → 账户行 → 流水插入”。
 - 支付已按上述锁序实现（F5）：先由 `WHERE status=0 AND expires_at>now` 的条件 `UPDATE` 取得订单行锁，再依次结转库存（仅秒杀）、更新账户、插入流水。失败的一侧在订单行上只**等待**、不持锁，因此“同一订单并发支付”与“同一用户两笔订单并发支付”都不会形成等待环；失败后用 `FOR SHARE` 当前读判定原因，避免 REPEATABLE READ 旧快照把已支付判成待支付而触发第二次入账。
 - 超时关闭使用 `(status, expires_at)` 索引和 `FOR UPDATE SKIP LOCKED`，每个短事务只关闭一笔订单；多个 Worker 可并行且不会重复释放库存。
-- F6 已按上述方式实现：领取走 `WHERE status=0 AND expires_at<=? ORDER BY expires_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`，被别的 Worker 占住的行直接跳过而不是排队，因此多实例是**分摊**积压而非串行处理，也不需要 ShedLock 之类的分布式锁。单次触发处理量由 `tokenx.order.timeout.max-orders-per-run` 上界（默认 100、上限 1000），循环次数有界；某笔失败即结束本次运行（该订单仍为 `UNPAID`，同一轮重试只会反复命中同一行），由下一次触发重试。支付与关单的锁序相同（`purchase_order → activity_inventory`），且两者的时间谓词互斥（`expires_at > now` 对 `expires_at <= now`），所以不存在两个赢家，也不存在等待环。
+- F6 已按上述方式实现：领取走 `WHERE status=0 AND expires_at<=? ORDER BY expires_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`，被别的 Worker 占住的行直接跳过而不是排队，因此多实例是**分摊**积压而非串行处理，也不需要 ShedLock 之类的分布式锁。单次触发处理量由 `tokenx.order.timeout.max-orders-per-run` 上界（默认 100、上限 1000），该上限限制的是**领取/尝试**次数而非成功数，循环次数随之有界。
+- 失败分两类，处理方式刻意不同：某一笔订单自身不变量破坏（预占缺失、条件更新影响 0 行）时，只回滚它那个 `REQUIRES_NEW` 短事务并记 ERROR，本轮把它的 `(expires_at, id)` 作为游标、从它之后继续领取，于是它身后的正常订单仍能在同一次运行内关闭；游标只活本次运行，下一次触发从扫描头部开始，坏订单因此每轮都会被重试，既不被删除/隐藏/强制关闭，也不会永久拉黑。领取语句失败、连接不可用、事务管理器拒绝开启等**基础设施级**失败没有“可越过的行”，直接向上抛出终止本轮，不会被伪装成“本轮没有到期订单”。
+- 每笔关闭的事务边界是 `PROPAGATION_REQUIRES_NEW`，由 `TransactionTemplate` 显式设置而不是靠默认 `REQUIRED`：被其它事务调用时，每笔关闭仍各自提交，调用方回滚不会撤销已报告的关闭，也不会让调用方在整个事务生命周期内累积订单行锁。集成测试以一个外层事务包裹批量关单后回滚来证明这一点（订单仍 `CLOSED`、库存释放保留）。
+- 支付与关单的锁序相同（`purchase_order → activity_inventory`），且两者的时间谓词互斥（`expires_at > now` 对 `expires_at <= now`）。跨边界的极端情况也被真实覆盖：支付线程读到 `expiresAt-1ms`、关单线程读到 `expiresAt`，两边同时可领取，此时唯一裁判是订单行锁——任一赢家合法，但只能有一个终态，余额/流水/库存都按赢家核对。
 - 超时 Worker 只做“订单行 → 库存行”两步写，不触碰账户与流水；普通订单连库存行都不访问。因此关单不会与用户余额或账本产生锁竞争，其并发度只受限于到期订单所在的行。
 - 死锁可对整个短事务做少量带抖动重试，但必须记录指标；不能只重放事务中间一条 SQL。
 

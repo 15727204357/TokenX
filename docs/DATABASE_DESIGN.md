@@ -582,10 +582,13 @@ VALUES (?, 1, ?, 1, ?, ?, ?);
 
 ```sql
 -- 1. 领取：跳过已被其它事务锁住的行，取最早到期的一笔（只读一次 Clock，截断到毫秒）
+--    游标条件只在本轮已经失败过一行时追加，用于越过那一行继续往后扫
 SELECT id, order_no, order_type, activity_id, status, expires_at, paid_at, closed_at
   FROM purchase_order
  WHERE status = 0
    AND expires_at <= ?
+   -- 有游标时追加：
+   -- AND (expires_at > ? OR (expires_at = ? AND id > ?))
  ORDER BY expires_at, id
  LIMIT 1
  FOR UPDATE SKIP LOCKED;
@@ -618,13 +621,18 @@ UPDATE activity_inventory
 积压，且**不需要分布式锁**。`ORDER BY expires_at, id` 让“下一行”在所有 Worker 眼里都是同一个顺序，
 `idx_order_timeout(status, expires_at)`（InnoDB 二级索引隐含主键）提供有序访问，不产生 filesort。
 
-**每单一个事务**：领取 → 关闭 → 释放 → 提交，然后循环处理下一单，循环次数由
+**每单一个事务，且是 `REQUIRES_NEW`**：领取 → 关闭 → 释放 → 提交，然后循环处理下一单，循环次数由
 `tokenx.order.timeout.max-orders-per-run` 限制。一次事务锁一批订单会让持锁时间与批大小成正比，且
 批次末尾失败会撤销前面已报告的结果；单事务单订单则最优情况下只丢一笔，已提交的订单保持已关闭。
+传播行为由 `TransactionTemplate` 显式设为 `PROPAGATION_REQUIRES_NEW`：若沿用默认 `REQUIRED`，从别的
+事务里调用这批关闭时它们会静默加入调用方事务，调用方一回滚就把“已经报告成功”的关闭撤销掉。
 
-**失败即停止本批**：库存释放影响 0 行 → 抛错 → 事务回滚（订单仍是 `UNPAID`，`closed_at` 仍为空）。
-失败的行在下一轮仍会被领取，因此同一批里立刻重试只会反复命中同一行；`closeExpiredOrders` 捕获后
-记录 ERROR 并结束本次运行，由下一次触发重试，循环因此始终有界。
+**单笔失败不阻塞积压**：库存释放影响 0 行 → 抛错 → 该订单的事务回滚（它仍是 `UNPAID`，`closed_at`
+仍为空），本轮把它的 `(expires_at, id)` 记为游标并从它之后继续领取，于是排在它后面的正常订单仍能
+在同一次运行里关闭。`max-orders-per-run` 限制的是领取/尝试次数（成功与失败都占名额），循环因此有界。
+游标只活本次运行，下一次触发从扫描头部开始，坏订单会被重新尝试——不删除、不隐藏、不强制关闭、也不
+永久拉黑；修复数据之前它每一轮都会失败并留下一条 ERROR。领取语句本身失败、连接不可用这类基础设施
+级失败没有“可越过的行”，异常向上抛出并终止本轮，不会被当成“本轮没有到期订单”。
 
 **普通订单与秒杀订单**：`NORMAL` 关闭只执行第 1–2 步，完全不读不写 `activity_inventory`；`SECKILL`
 必须第 3 步影响 1 行，否则整笔回滚——“关了单却没还库存”和“还了库存但订单没关”都不允许出现。

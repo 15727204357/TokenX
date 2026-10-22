@@ -1,5 +1,6 @@
 package com.tokenx.order;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -414,6 +415,17 @@ public abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   /** The order row behind a number owned by this user, for asserting the stored state. */
   protected PurchaseOrder storedOrder(String orderNo, long userId) {
     return orderMapper.selectByOrderNoAndUser(orderNo, userId);
+  }
+
+  /**
+   * Breaks the invariant a closure depends on: an order claims a reservation the activity no longer
+   * holds. No normal path can produce this, so tests that need a corrupt row write it here.
+   */
+  protected void drainReservations(long activityId) {
+    ActivityInventory broken = storedInventory(activityId);
+    broken.setReservedStock(0);
+    inventoryMapper.updateById(broken);
+    assertThat(storedInventory(activityId).getReservedStock()).isZero();
   }
 
   /**

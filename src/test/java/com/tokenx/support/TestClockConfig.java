@@ -46,4 +46,16 @@ public class TestClockConfig {
   public static void advance(Duration amount) {
     CLOCK.advance(amount);
   }
+
+  /**
+   * Gives the calling thread its own "now", so two threads can sit on opposite sides of a deadline
+   * at the same instant. Always paired with {@link #unpinCurrentThread()} in a {@code finally}.
+   */
+  public static void pinCurrentThread(Instant instant) {
+    CLOCK.pinCurrentThread(instant);
+  }
+
+  public static void unpinCurrentThread() {
+    CLOCK.unpinCurrentThread();
+  }
 }

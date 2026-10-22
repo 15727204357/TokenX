@@ -18,6 +18,16 @@ public final class MutableClock extends Clock {
   private final ZoneId zone;
   private volatile Instant instant;
 
+  /**
+   * An instant <em>this thread</em> reads instead of the shared one, invisible to every other thread.
+   *
+   * <p>Needed when two threads must disagree about "now" at the same moment: a race between payment
+   * and closure only reaches the interesting edge if one side reads just inside the deadline while
+   * the other reads the deadline itself. Advancing the shared instant between the two reads would
+   * serialise them, and the race would test nothing.
+   */
+  private final ThreadLocal<Instant> pinnedHere = new ThreadLocal<>();
+
   public MutableClock(Instant initial) {
     this(initial, ZoneOffset.UTC);
   }
@@ -35,6 +45,16 @@ public final class MutableClock extends Clock {
     this.instant = this.instant.plus(amount);
   }
 
+  /** Makes the calling thread read {@code target} until {@link #unpinCurrentThread()}. */
+  public void pinCurrentThread(Instant target) {
+    pinnedHere.set(target);
+  }
+
+  /** Drops the calling thread's override; it reads the shared instant again. */
+  public void unpinCurrentThread() {
+    pinnedHere.remove();
+  }
+
   @Override
   public ZoneId getZone() {
     return zone;
@@ -47,6 +67,7 @@ public final class MutableClock extends Clock {
 
   @Override
   public Instant instant() {
-    return instant;
+    Instant pinned = pinnedHere.get();
+    return pinned != null ? pinned : instant;
   }
 }

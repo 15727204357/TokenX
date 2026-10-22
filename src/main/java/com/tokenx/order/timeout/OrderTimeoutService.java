@@ -12,6 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -23,17 +24,24 @@ import org.springframework.transaction.support.TransactionTemplate;
  * {@code expires_at <= now}. Whichever runs second therefore finds a row that no longer matches and
  * reports a business answer instead of acting.
  *
- * <p><b>One order, one transaction.</b> Each call to {@link #closeNextExpiredOrder()} opens its own
- * transaction, claims one row, closes it, settles the stock and commits. Nothing is batched: a
- * transaction that closed twenty orders would hold twenty order locks and one stock lock for the
- * length of the whole batch, and a failure at the end would undo work that had already been
- * reported. A batch is a loop of such transactions, which is also why a crashed worker leaves a
- * fully consistent table — some orders closed, the rest still unpaid and still reserved.
+ * <p><b>One order, one transaction — and always a new one.</b> The boundary is
+ * {@link TransactionDefinition#PROPAGATION_REQUIRES_NEW}, not the default {@code REQUIRED}: a batch
+ * invoked from inside somebody else's transaction must still commit each order separately. With
+ * {@code REQUIRED} the orders would silently join the caller's transaction, so a later rollback
+ * would undo closures that had already been reported, and the caller's transaction would hold one
+ * order lock per order for its whole lifetime.
  *
  * <p><b>Lock order is the payment's lock order</b> ({@code purchase_order → activity_inventory}).
  * Both paths take the order row first, so neither can be waiting for a stock row while the other
  * waits for the order it belongs to. The claim uses {@code FOR UPDATE SKIP LOCKED}, so a worker that
  * loses the race for a row does not queue behind the winner; it moves on.
+ *
+ * <p><b>A broken order does not block the backlog.</b> An order that cannot be closed keeps its
+ * {@code UNPAID} status and stays first in the scan order, so the run would claim it again on the
+ * very next iteration and fail on it forever. Instead the run remembers where it failed and continues
+ * from just after that row, which lets every healthy order behind it be closed in the same run. The
+ * broken row is not deleted, not hidden and not forced closed: it is the first candidate again on
+ * the next run, and its failure is logged every time until somebody fixes the data.
  *
  * <p>Nothing here credits, posts or deletes. A closed order keeps {@code paid_at} empty, gains
  * {@code closed_at}, and stays in the table — the permanent {@code (activity_id, user_id)} key is
@@ -61,33 +69,65 @@ public class OrderTimeoutService {
     // Explicit boundary for the same reason as payment: the transaction body is what a reviewer has
     // to be able to read as one list of statements, and each call here must be exactly one of them.
     this.writeTemplate = new TransactionTemplate(transactionManager);
+    // REQUIRES_NEW, not the default REQUIRED: "one order, one transaction" has to hold even when a
+    // caller already has a transaction open. Joining it would let a caller's rollback undo closures
+    // this method has already committed and reported.
+    this.writeTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
   }
 
   /**
-   * Closes up to {@code maxOrders} expired orders, each in its own transaction.
+   * Closes expired orders, one per transaction, until the budget runs out or the backlog is empty.
    *
-   * <p>The loop is bounded twice: by the batch size, and by the scan itself returning no row. It
-   * stops on the first failure as well — a row that cannot be closed (for example because the stock
-   * it should release is gone) would be claimed again immediately by the next iteration, because the
-   * failed transaction released its lock without changing the row. Retrying it in place would spin
-   * on the same order forever, so the run ends and the failure is logged; the next trigger tries
-   * again, which is bounded by the interval instead of by a loop.
+   * <p>{@code maxAttempts} bounds <em>claims</em>, not successes: a broken order consumes a slot and
+   * so does a healthy one. That is what keeps a run bounded when the front of the backlog is
+   * unhealthy — otherwise "one failure per iteration" would either be unbounded or permanently block
+   * everything behind the failure.
    *
-   * @param maxOrders batch size; a non-positive value closes nothing
+   * <p>Two kinds of failure are treated differently, on purpose:
+   *
+   * <ul>
+   *   <li>an order whose own invariants are broken (its reservation is missing, or it refused to
+   *       change state) is rolled back, logged, and skipped by moving the cursor past it — the rest
+   *       of the run still closes what it can;
+   *   <li>anything else — the claim statement itself failing, the connection dying, the transaction
+   *       manager refusing to start — propagates. At that point there is no row to move past, and
+   *       pretending the run was simply empty would hide an outage.
+   * </ul>
+   *
+   * <p>The cursor only lives for this call. The next run starts from the beginning of the scan, so a
+   * broken order is retried every time and is never quietly skipped forever.
+   *
+   * @param maxAttempts how many orders this run may claim, successful or not; non-positive does nothing
    * @return how many orders this run closed
    */
-  public int closeExpiredOrders(int maxOrders) {
+  public int closeExpiredOrders(int maxAttempts) {
     int closed = 0;
-    while (closed < maxOrders) {
+    int attempts = 0;
+    LocalDateTime cursorExpiresAt = null;
+    Long cursorId = null;
+
+    while (attempts < maxAttempts) {
+      attempts++;
       try {
-        if (!closeNextExpiredOrder()) {
+        PurchaseOrder closedOrder = closeOne(cursorExpiresAt, cursorId);
+        if (closedOrder == null) {
           break;
         }
-      } catch (RuntimeException failure) {
-        log.error("order timeout run stopped after closing {} order(s)", closed, failure);
-        break;
+        closed++;
+        cursorExpiresAt = closedOrder.getExpiresAt();
+        cursorId = closedOrder.getId();
+      } catch (OrderTimeoutFailure failure) {
+        // The row is intact and still UNPAID: only its own transaction rolled back. Move the cursor
+        // past it so the healthy orders behind it are not starved by it.
+        log.error(
+            "order {} failed to close; skipping it for the rest of this run (attempt {} of {})",
+            failure.orderId(),
+            attempts,
+            maxAttempts,
+            failure);
+        cursorExpiresAt = failure.expiresAtColumn();
+        cursorId = failure.orderId();
       }
-      closed++;
     }
     return closed;
   }
@@ -102,28 +142,39 @@ public class OrderTimeoutService {
    * @return whether an order was closed
    */
   public boolean closeNextExpiredOrder() {
-    return Boolean.TRUE.equals(writeTemplate.execute(status -> closeOne()));
+    return closeOne(null, null) != null;
   }
 
   // --- transaction body -------------------------------------------------------------------------
 
-  private boolean closeOne() {
+  /**
+   * One claim-and-close inside one {@code REQUIRES_NEW} transaction.
+   *
+   * @param afterExpiresAt deadline of the row this run last attempted, {@code null} for the first
+   * @param afterId id of the row this run last attempted, {@code null} for the first
+   * @return the order that was closed, or {@code null} when nothing expired is left
+   */
+  private PurchaseOrder closeOne(LocalDateTime afterExpiresAt, Long afterId) {
+    return writeTemplate.execute(status -> closeInTransaction(afterExpiresAt, afterId));
+  }
+
+  private PurchaseOrder closeInTransaction(LocalDateTime afterExpiresAt, Long afterId) {
     // One clock reading for the whole closure: the claim compares deadlines against it, and
     // closed_at and updated_at both describe that same instant. A second reading could stamp a
     // closure later than the deadline it was justified by.
     Instant now = clock.instant().truncatedTo(ChronoUnit.MILLIS);
     LocalDateTime nowColumn = PurchaseOrder.toColumn(now);
 
-    PurchaseOrder order = orderMapper.selectNextExpiredForUpdateSkipLocked(nowColumn);
+    PurchaseOrder order = orderMapper.selectNextExpiredAfter(nowColumn, afterExpiresAt, afterId);
     if (order == null) {
-      return false;
+      return null;
     }
 
     // The claim chose this row; this statement is the gate. Zero rows means the row stopped being
     // expendable between the two statements, which no concurrent writer can cause while we hold the
     // lock — so it is an inconsistency, not a race, and closing it anyway would be a guess.
     if (orderMapper.markClosed(order.getId(), nowColumn) != 1) {
-      throw brokenInvariant("order " + order.getOrderNo() + " refused to become CLOSED");
+      throw brokenInvariant(order, "refused to become CLOSED");
     }
 
     if (order.getOrderType() == OrderType.SECKILL) {
@@ -131,7 +182,7 @@ public class OrderTimeoutService {
     }
 
     log.debug("closed expired order orderNo={} type={}", order.getOrderNo(), order.getOrderType());
-    return true;
+    return order;
   }
 
   /**
@@ -143,27 +194,46 @@ public class OrderTimeoutService {
   private void releaseReservation(PurchaseOrder order) {
     Long activityId = order.getActivityId();
     if (activityId == null) {
-      throw brokenInvariant(
-          "a seckill order has no activity to release stock for: " + order.getOrderNo());
+      throw brokenInvariant(order, "seckill order has no activity to release stock for");
     }
     if (inventoryMapper.releaseReserved(activityId) != 1) {
       throw brokenInvariant(
-          "activity "
-              + activityId
-              + " has no reservation to release for order "
-              + order.getOrderNo());
+          order, "activity " + activityId + " has no reservation to release");
     }
   }
 
   /**
-   * An inconsistency the closure cannot resolve.
+   * An inconsistency that belongs to one order, not to the run.
    *
-   * <p>Logged with the order number only — never the buyer, the balance or a request body — and
-   * thrown so the transaction rolls back. What matters is that the order stays {@code UNPAID} and
-   * the stock stays as it was, rather than the two drifting apart.
+   * <p>Carries the row's {@code (expires_at, id)} so the batch can continue after it. It extends
+   * {@link IllegalStateException} because that is what "an invariant this code cannot repair" has
+   * always been reported as here; the cursor is extra information for the caller, not a new failure
+   * category. Logged with identifiers only — never the buyer, the balance or a request body.
    */
-  private IllegalStateException brokenInvariant(String detail) {
-    log.error("order timeout invariant broken: {}", detail);
-    return new IllegalStateException(detail);
+  private static final class OrderTimeoutFailure extends IllegalStateException {
+
+    private final LocalDateTime expiresAtColumn;
+    private final long orderId;
+
+    OrderTimeoutFailure(PurchaseOrder order, String detail) {
+      super(detail + "; orderNo=" + order.getOrderNo());
+      this.expiresAtColumn = order.getExpiresAt();
+      this.orderId = order.getId();
+    }
+
+    LocalDateTime expiresAtColumn() {
+      return expiresAtColumn;
+    }
+
+    long orderId() {
+      return orderId;
+    }
+  }
+
+  /** Reports one order's broken invariant with the coordinates the batch needs to move past it. */
+  private OrderTimeoutFailure brokenInvariant(PurchaseOrder order, String detail) {
+    OrderTimeoutFailure failure = new OrderTimeoutFailure(order, detail);
+    log.error("order timeout invariant broken: {}", failure.getMessage());
+    return failure;
   }
 }

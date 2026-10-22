@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/http';
 import { fetchOrder, mockPayOrder, type OrderDetail, type OrderStatus } from '../api/orders';
@@ -10,6 +10,15 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   PAID: '已支付',
   CLOSED: '已关闭',
 };
+
+/**
+ * The two things this page can ask the server to do.
+ *
+ * <p>They are kept in one piece of state, not two booleans, because they are mutually exclusive by
+ * nature: a payment and a refresh of the same order would race each other for the screen, and the
+ * loser could paint an older order over a newer one. One field cannot describe "both at once".
+ */
+type PageAction = 'pay' | 'refresh';
 
 /**
  * Why a payment was refused, in words the buyer can act on.
@@ -69,10 +78,16 @@ function refreshMessage(error: unknown): string {
  * answer `409`. An expired order becomes `CLOSED` when the server's timeout scan runs, so the way to
  * see that is to ask the server again, which is what the refresh action does.
  *
- * <p>The payment button exists only for `UNPAID`. While a request is in flight it is disabled, so a
- * double click cannot become two calls; and when the server answers, the returned order — not an
- * assumption — becomes the state this page renders. `PAID` and `CLOSED` therefore never offer a
- * button, without any extra rule.
+ * <p>The payment button exists only for `UNPAID`. At most one request may be in flight, so the two
+ * actions cannot interleave: while one runs, both buttons are disabled and a click that slips
+ * through anyway is refused by a synchronous in-flight flag, not by a rendered attribute. When the
+ * server answers, the returned order — not an assumption — becomes the state this page renders.
+ * `PAID` and `CLOSED` therefore never offer a button, without any extra rule.
+ *
+ * <p>Once the server has reported a settled order, a later snapshot claiming it is still `UNPAID` is
+ * ignored. That is not defensive noise: a refresh can be answered by a read older than the payment
+ * that just committed, and letting it through would put the pay button back on a paid order and send
+ * the buyer into a `409`.
  *
  * <p>There is no polling and no countdown: a refresh happens when the buyer asks for one, and a
  * failed refresh keeps the previous order rather than inventing a closed one.
@@ -88,11 +103,36 @@ export function OrderPage() {
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [paying, setPaying] = useState(false);
+  const [action, setAction] = useState<PageAction | null>(null);
   const [payError, setPayError] = useState<string | null>(null);
   const [paidNotice, setPaidNotice] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+
+  /** The action currently running, readable without waiting for a render. */
+  const inFlight = useRef<PageAction | null>(null);
+
+  /** Whether the server has already told us this order is paid or closed. */
+  const settled = useRef(false);
+
+  /**
+   * Adopts an order the server just returned, unless it is an older story than the one on screen.
+   *
+   * <p>Only `UNPAID` can be stale in practice: paid and closed are finite states, so nothing that
+   * happens later can legitimately undo them. A snapshot that claims otherwise is older than what
+   * this page already knows, and dropping it is the difference between "the truth as far as I know
+   * it" and "the truth as of a request that started earlier".
+   */
+  const applyServerOrder = useCallback((next: OrderDetail) => {
+    if (next.status !== 'UNPAID') {
+      settled.current = true;
+      setOrder(next);
+      return;
+    }
+    if (settled.current) {
+      return;
+    }
+    setOrder(next);
+  }, []);
 
   useEffect(() => {
     if (!orderNo) {
@@ -102,6 +142,7 @@ export function OrderPage() {
     }
 
     let cancelled = false;
+    settled.current = false;
     setLoading(true);
     setError(null);
     setNotFound(false);
@@ -109,7 +150,7 @@ export function OrderPage() {
     fetchOrder(orderNo)
       .then((detail) => {
         if (!cancelled) {
-          setOrder(detail);
+          applyServerOrder(detail);
         }
       })
       .catch((cause: unknown) => {
@@ -132,51 +173,71 @@ export function OrderPage() {
     return () => {
       cancelled = true;
     };
-  }, [orderNo, attempt]);
+  }, [orderNo, attempt, applyServerOrder]);
+
+  /**
+   * Claims the single in-flight slot, or reports that somebody already holds it.
+   *
+   * <p>The flag is set before the first render, so two clicks in the same tick still see one
+   * occupied slot. Clearing the other action's error is part of claiming it: a message about the
+   * previous attempt is no longer the current story, and leaving it would attribute it to this one.
+   */
+  function beginAction(next: PageAction): boolean {
+    if (inFlight.current !== null) {
+      return false;
+    }
+    inFlight.current = next;
+    setAction(next);
+    setPayError(null);
+    setRefreshError(null);
+    if (next === 'pay') {
+      setPaidNotice(null);
+    }
+    return true;
+  }
+
+  function endAction() {
+    inFlight.current = null;
+    setAction(null);
+  }
 
   async function pay() {
-    if (!order || paying) {
+    if (!order || !beginAction('pay')) {
       // A second click while one request is in flight is not a second payment.
       return;
     }
 
-    setPaying(true);
-    setPayError(null);
-    setPaidNotice(null);
-
     try {
       const updated = await mockPayOrder(order.orderNo);
-      setOrder(updated);
+      applyServerOrder(updated);
       if (updated.status === 'PAID') {
         setPaidNotice('支付成功，Token 已入账');
       }
     } catch (cause) {
       setPayError(paymentMessage(cause));
     } finally {
-      setPaying(false);
+      endAction();
     }
   }
 
   async function refresh() {
-    if (!order || refreshing || paying) {
+    if (!order || !beginAction('refresh')) {
       // A second click while one request is in flight would only re-read the same row.
       return;
     }
 
-    setRefreshing(true);
-    setRefreshError(null);
-
     try {
-      const latest = await fetchOrder(order.orderNo);
       // The response is the state: if the timeout scan has closed the order since it was loaded,
       // this is where the page learns it, and the badge and closedAt follow from that object.
-      setOrder(latest);
-      setPaidNotice(null);
-      setPayError(null);
+      const latest = await fetchOrder(order.orderNo);
+      applyServerOrder(latest);
+      if (latest.status !== 'PAID') {
+        setPaidNotice(null);
+      }
     } catch (cause) {
       setRefreshError(refreshMessage(cause));
     } finally {
-      setRefreshing(false);
+      endAction();
     }
   }
 
@@ -251,17 +312,22 @@ export function OrderPage() {
 
           <div className="actions">
             {order.status === 'UNPAID' ? (
-              <button type="button" onClick={() => void pay()} disabled={paying} aria-busy={paying}>
-                {paying ? '正在支付…' : '模拟支付'}
+              <button
+                type="button"
+                onClick={() => void pay()}
+                disabled={action !== null}
+                aria-busy={action === 'pay'}
+              >
+                {action === 'pay' ? '正在支付…' : '模拟支付'}
               </button>
             ) : null}
             <button
               type="button"
               onClick={() => void refresh()}
-              disabled={refreshing || paying}
-              aria-busy={refreshing}
+              disabled={action !== null}
+              aria-busy={action === 'refresh'}
             >
-              {refreshing ? '正在刷新…' : '刷新订单状态'}
+              {action === 'refresh' ? '正在刷新…' : '刷新订单状态'}
             </button>
           </div>
 

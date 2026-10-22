@@ -197,27 +197,34 @@
 
 ### [x] F6 订单超时关闭与释放库存
 
-> 完成记录（2026-10-21，分支 `feature/F6-order-timeout`）：
+> 完成记录（2026-10-21，分支 `feature/F6-order-timeout`；2026-10-22 复审修复）：
 > **零 DDL**：无新迁移，Flyway 仍停在 `V9`，复用 `V8` 的 `idx_order_timeout(status, expires_at)`。
 > 新增 `order/timeout/`：`OrderTimeoutService`（关单能力）、`OrderTimeoutScheduler`（`@Scheduled`
 > 触发，`enabled=false` 时整个 Bean 不存在）、`OrderTimeoutConfig`（`@EnableScheduling`）；
-> 只给既有 Mapper 加三条 SQL：`selectNextExpiredForUpdateSkipLocked`、`markClosed`、`releaseReserved`。
-> 领取：`WHERE status=0 AND expires_at<=? ORDER BY expires_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`
-> （被他人锁住的行跳过而非等待）；关闭：`UPDATE … SET status=2, closed_at=?, updated_at=?
-> WHERE id=? AND status=0 AND expires_at<=?`，影响 0 行抛错；秒杀订单同事务
-> `reserved_stock-1, available_stock+1 WHERE reserved_stock>0`，影响 0 行整笔回滚。
-> **每单一个 `TransactionTemplate` 事务**（领取→关闭→释放→提交→下一单），批量上界由
-> `tokenx.order.timeout.max-orders-per-run`（默认 100、上限 1000）控制；单笔失败记录 ERROR 并结束
-> 本次运行，避免在同一行上紧循环。支付与关单锁序统一为 `purchase_order → activity_inventory`，
+> 只给既有 Mapper 加三条 SQL：`selectNextExpiredAfter`、`markClosed`、`releaseReserved`。
+> 领取：`WHERE status=0 AND expires_at<=?` + 可选游标条件 `(expires_at>? OR (expires_at=? AND id>?))`
+> `ORDER BY expires_at,id LIMIT 1 FOR UPDATE SKIP LOCKED`（被他人锁住的行跳过而非等待）；
+> 关闭：`UPDATE … SET status=2, closed_at=?, updated_at=? WHERE id=? AND status=0 AND expires_at<=?`，
+> 影响 0 行抛错；秒杀订单同事务 `reserved_stock-1, available_stock+1 WHERE reserved_stock>0`，
+> 影响 0 行整笔回滚。
+> **每单一个 `TransactionTemplate` 事务，传播显式设为 `REQUIRES_NEW`**（默认 `REQUIRED` 会让批量关单
+> 静默加入调用方事务，调用方一回滚就撤销已报告的关闭），批量上界由
+> `tokenx.order.timeout.max-orders-per-run`（默认 100、上限 1000）控制，且限制的是**领取/尝试**次数。
+> 单笔失败只回滚它自己那个事务并记 ERROR，本轮用“失败游标”越过该行继续处理后面的正常订单；游标只活
+> 本次运行，下一轮从头扫描故会重试，坏订单不被删除/隐藏/强制关闭/永久拉黑；领取语句失败等基础设施级
+> 失败直接终止本轮并暴露异常。支付与关单锁序统一为 `purchase_order → activity_inventory`，
 > 时间谓词 `expires_at > now` 与 `expires_at <= now` 互斥，因此只有一个赢家。
 > 普通订单只改订单（不读不写库存），`paid_at` 保持 `NULL`，不写流水、不改余额、不删订单。
 > 测试环境 `tokenx.order.timeout.enabled=false`，集成测试直接调用关单能力并用可控 `Clock` 推进时间。
-> `./mvnw clean verify` **248 个测试通过**（新增 16 个，真实 MySQL `tokenx_test`：普通/秒杀关闭、
+> `./mvnw clean verify` **255 个测试通过**（F6 新增 23 个，真实 MySQL `tokenx_test`：普通/秒杀关闭、
 > `expiresAt-1ms` 不关/精确时刻关、未到期、已支付不关、重复扫描只释放一次、混合渠道、
 > 有界批处理与续航、`SKIP LOCKED` 真实阻塞验证（临时去掉 `SKIP LOCKED` 该用例会挂住）、
-> 3 Worker 并发分摊、支付/关单在两个边界上的竞争、预留缺失时的整笔回滚与批量停止、测试环境调度关闭）。
-> 前端 `pnpm lint` / `test`(**53**) / `build` / `format:check` 通过：订单页新增“刷新订单状态”，
-> 只按服务端响应更新状态，刷新中禁用、失败不改本地状态。
+> 3 Worker 并发分摊、支付/关单在两个边界上的竞争、付款线程读 `expiresAt-1ms` 而关单线程读 `expiresAt`
+> 的跨边界竞争（任一赢家合法，逐项核对订单/钱包/流水/库存）、外层事务回滚后已关闭订单仍为 `CLOSED`
+> 且库存释放保留、最早到期坏订单不阻塞其后正常订单且下一轮重试、测试环境调度关闭）。
+> 前端 `pnpm lint` / `test`(**58**) / `build` / `format:check` 通过：订单页新增“刷新订单状态”，与支付
+> 用单一 `action` 状态互斥（刷新中不能支付、支付中不能刷新、两按钮同时禁用），开始任一动作清除另一
+> 动作遗留的错误，已 `PAID`/`CLOSED` 后到达的旧 `UNPAID` 快照被丢弃，刷新失败不改本地状态。
 
 **范围**：超时订单 `UNPAID → CLOSED`；仅秒杀订单释放预留库存；本地调度器按 `(status,expires_at)` 扫描，使用 `FOR UPDATE SKIP LOCKED` 和单订单短事务支持多 Worker；页面更新状态。
 

@@ -1,5 +1,5 @@
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/http';
@@ -240,6 +240,108 @@ describe('订单详情页', () => {
     renderPage();
 
     expect(await screen.findByText('已关闭')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '模拟支付' })).not.toBeInTheDocument();
+  });
+
+  it('刷新进行中支付按钮禁用，点击不会发起支付', async () => {
+    let finishRefresh!: (value: OrderDetail) => void;
+    vi.mocked(fetchOrder)
+      .mockResolvedValueOnce(sample)
+      .mockReturnValueOnce(
+        new Promise<OrderDetail>((resolve) => {
+          finishRefresh = resolve;
+        }),
+      );
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '刷新订单状态' }));
+
+    const payButton = screen.getByRole('button', { name: '模拟支付' });
+    expect(payButton).toBeDisabled();
+    await userEvent.click(payButton);
+    expect(mockPayOrder).not.toHaveBeenCalled();
+
+    finishRefresh(closed);
+
+    expect(await screen.findByText('已关闭')).toBeInTheDocument();
+    expect(mockPayOrder).not.toHaveBeenCalled();
+  });
+
+  it('支付进行中刷新按钮禁用，点击不会发起读取', async () => {
+    vi.mocked(fetchOrder).mockResolvedValue(sample);
+    let finishPayment!: (value: OrderDetail) => void;
+    vi.mocked(mockPayOrder).mockReturnValue(
+      new Promise<OrderDetail>((resolve) => {
+        finishPayment = resolve;
+      }),
+    );
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '模拟支付' }));
+
+    const refreshButton = screen.getByRole('button', { name: '刷新订单状态' });
+    expect(refreshButton).toBeDisabled();
+    await userEvent.click(refreshButton);
+    // The initial load is the only read: a refresh would have made it two.
+    expect(fetchOrder).toHaveBeenCalledTimes(1);
+
+    finishPayment(paid);
+
+    expect(await screen.findByText('已支付')).toBeInTheDocument();
+    expect(fetchOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('开始刷新时清除支付留下的错误提示', async () => {
+    vi.mocked(fetchOrder).mockResolvedValueOnce(sample).mockResolvedValueOnce(closed);
+    vi.mocked(mockPayOrder).mockRejectedValue(
+      new ApiError(409, 'ORDER_STATE_CONFLICT', 'order has expired'),
+    );
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '模拟支付' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('订单已过期或已关闭，无法支付');
+
+    await userEvent.click(screen.getByRole('button', { name: '刷新订单状态' }));
+
+    expect(await screen.findByText('已关闭')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('开始支付时清除刷新留下的错误提示', async () => {
+    vi.mocked(fetchOrder)
+      .mockResolvedValueOnce(sample)
+      .mockRejectedValueOnce(new ApiError(500, 'INTERNAL_ERROR', 'unexpected server error'));
+    vi.mocked(mockPayOrder).mockResolvedValue(paid);
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '刷新订单状态' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('刷新失败，请稍后重试');
+
+    await userEvent.click(screen.getByRole('button', { name: '模拟支付' }));
+
+    expect(await screen.findByText('已支付')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('支付成功后刷新返回更旧的待支付快照，不把订单拉回待支付', async () => {
+    // A second read that started before the payment committed: it still describes `UNPAID`.
+    vi.mocked(fetchOrder).mockResolvedValueOnce(sample).mockResolvedValueOnce(sample);
+    vi.mocked(mockPayOrder).mockResolvedValue(paid);
+
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: '模拟支付' }));
+    expect(await screen.findByText('已支付')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: '刷新订单状态' }));
+
+    await waitFor(() => expect(fetchOrder).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('已支付')).toBeInTheDocument();
+    expect(screen.queryByText('待支付')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '模拟支付' })).not.toBeInTheDocument();
   });
 

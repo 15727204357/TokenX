@@ -60,7 +60,7 @@ class OrderTimeoutRollbackTest extends AbstractOrderApiTest {
   }
 
   @Test
-  void shouldStopTheBatchInsteadOfSpinningOnTheBrokenOrder() throws Exception {
+  void shouldSkipTheBrokenOrderWithoutSpinningOnIt() throws Exception {
     Buyer buyer = registerBuyer();
     long activityId = openActivity(adminToken(), 100L, 5L);
     String orderNo = placeOneSeckillOrder(buyer, activityId);
@@ -69,21 +69,13 @@ class OrderTimeoutRollbackTest extends AbstractOrderApiTest {
     TestClockConfig.setTo(expiresAtOf(orderNo, buyer.id()));
 
     assertThat(timeoutService.closeExpiredOrders(50))
-        .as("a failed order ends the run; it does not become an unbounded retry loop")
+        .as("the failed order is skipped by the cursor, so the run ends instead of retrying it")
         .isZero();
     assertThat(storedOrder(orderNo, buyer.id()).getStatus()).isEqualTo(OrderStatus.UNPAID);
     assertThat(storedInventory(activityId).getAvailableStock()).isEqualTo(4);
   }
 
   // --- fixtures -------------------------------------------------------------------------------
-
-  /** Breaks the invariant the closure is supposed to rely on: a reserved unit that is not there. */
-  private void drainReservations(long activityId) {
-    ActivityInventory broken = storedInventory(activityId);
-    broken.setReservedStock(0);
-    inventoryMapper.updateById(broken);
-    assertThat(storedInventory(activityId).getReservedStock()).isZero();
-  }
 
   private String placeOneSeckillOrder(Buyer buyer, long activityId) throws Exception {
     MvcResult created =

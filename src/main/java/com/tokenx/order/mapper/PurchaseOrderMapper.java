@@ -142,7 +142,7 @@ public interface PurchaseOrderMapper extends BaseMapper<PurchaseOrder> {
       @Param("orderNo") String orderNo, @Param("userId") long userId);
 
   /**
-   * Claims the oldest expired unpaid order for this transaction, or nothing.
+   * Claims the oldest expired unpaid order after a cursor, or nothing.
    *
    * <p>{@code FOR UPDATE SKIP LOCKED} is what lets several workers share one backlog: a row another
    * transaction already holds is stepped over instead of waited for, so instances do not queue behind
@@ -157,22 +157,46 @@ public interface PurchaseOrderMapper extends BaseMapper<PurchaseOrder> {
    * <p>{@code expires_at <= now} is the exact boundary: an order is closeable from the deadline
    * itself, and payable only while strictly before it. The two predicates therefore never both hold.
    *
+   * <p><b>The cursor exists for one reason: failure isolation.</b> A row that cannot be closed keeps
+   * its {@code UNPAID} status and its place at the head of the scan, so retrying it immediately would
+   * fail forever and starve everything behind it. Passing the failed row's {@code (expires_at, id)}
+   * moves the scan past it for the rest of this run, while still leaving it in the table and still
+   * making it the first candidate of the next run.
+   *
+   * <p>The range predicate is inside a dynamic {@code <if>} rather than written as
+   * {@code :after IS NULL OR ...}: the first claim of a run passes no cursor and must keep a plain
+   * index range scan, and an always-present {@code OR} would invite a plan that cannot use the index
+   * at all.
+   *
    * <p>Taking this lock is also what orders closure against payment: both paths lock the order row
    * first and only then touch stock, so the second one to arrive sees a decided row.
+   *
+   * @param now upper bound on the deadline, from the caller's single clock reading
+   * @param afterExpiresAt deadline of the last row this run attempted, {@code null} to start over
+   * @param afterId id of the last row this run attempted, {@code null} to start over
    */
   @Select(
       """
+      <script>
       SELECT id, order_no, request_id, user_id, package_id, activity_id, order_type,
              package_name_snapshot, credit_amount, pay_amount_cent, status,
              expires_at, paid_at, closed_at, created_at, updated_at
       FROM purchase_order
       WHERE status = 0
-        AND expires_at <= #{now}
+        AND expires_at &lt;= #{now}
+      <if test="afterExpiresAt != null">
+        AND (expires_at &gt; #{afterExpiresAt}
+             OR (expires_at = #{afterExpiresAt} AND id &gt; #{afterId}))
+      </if>
       ORDER BY expires_at, id
       LIMIT 1
       FOR UPDATE SKIP LOCKED
+      </script>
       """)
-  PurchaseOrder selectNextExpiredForUpdateSkipLocked(@Param("now") LocalDateTime now);
+  PurchaseOrder selectNextExpiredAfter(
+      @Param("now") LocalDateTime now,
+      @Param("afterExpiresAt") LocalDateTime afterExpiresAt,
+      @Param("afterId") Long afterId);
 
   /**
    * Moves one unpaid, already expired order to {@code CLOSED}, or changes nothing at all.

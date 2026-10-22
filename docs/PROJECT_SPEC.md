@@ -249,17 +249,21 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 - **领取用 `FOR UPDATE SKIP LOCKED`**：`WHERE status=0 AND expires_at<=? ORDER BY expires_at,id
   LIMIT 1 FOR UPDATE SKIP LOCKED`。其他 Worker 正在处理的行被跳过而不是等待，多实例可并行分摊积压；
   不引入分布式锁、Quartz、XXL-JOB 或 ShedLock。
-- **每单一个短事务**：领取 → 条件 `UPDATE … WHERE id=? AND status=0 AND expires_at<=?`（影响 0 行即
-  不变量破坏）→ 秒杀订单同事务归还预占 → 提交 → 下一单。禁止“一次事务锁一批”。
+- **每单一个短事务，且是 `REQUIRES_NEW`**：领取 → 条件 `UPDATE … WHERE id=? AND status=0 AND expires_at<=?`
+  （影响 0 行即不变量破坏）→ 秒杀订单同事务归还预占 → 提交 → 下一单。禁止“一次事务锁一批”；传播
+  行为由代码显式设置，因此即使调用方已开事务，每笔关闭也各自提交，调用方回滚不会撤销它。
 - **普通订单只改订单**：`NORMAL` 不读不写 `activity_inventory`。秒杀订单执行
   `reserved_stock-1, available_stock+1 WHERE reserved_stock>0`，影响 0 行抛错并整笔回滚。
 - **关闭不产生钱**：`paid_at` 保持 `NULL`，不写流水、不改余额；订单不删除，`(activity_id,user_id)`
   唯一约束保留，因此过期后不能靠重新下单绕过一人一单。
 - **时间**：`closed_at` 与 `updated_at` 取该笔关单事务读取的同一个 UTC `Clock` 值（毫秒），
   客户端时间不参与。
-- **有界批量**：单次触发最多处理 `tokenx.order.timeout.max-orders-per-run`（默认 100，上限 1000）；
-  单笔失败立即结束本次运行并记录 ERROR（失败订单仍为 `UNPAID`，同一轮重试会再次领取同一行），
-  下次触发再试。
+- **有界批量与失败隔离**：单次触发最多**领取/尝试** `tokenx.order.timeout.max-orders-per-run`
+  （默认 100，上限 1000）次，成功与失败各占一个名额。某笔订单自身不变量破坏时只回滚它自己那个
+  事务并记 ERROR，本轮用一个“失败游标”（排序键 `(expires_at, id)`）越过它继续处理后面的正常订单；
+  游标只活本次运行，下一次触发从扫描头部开始，因此坏订单会被重新尝试，既不删除、不隐藏、不强制
+  关闭，也不会永久拉黑。领取语句失败、数据库不可用等基础设施级失败没有“可越过的行”，直接终止本轮
+  并暴露错误，而不是伪装成“本轮无到期订单”。
 - **零 DDL**：不新增迁移，复用 `V8` 的 `idx_order_timeout(status, expires_at)`，schema 仍为 `V9`。
 
 ## 8. 运行时拓扑（V1）
