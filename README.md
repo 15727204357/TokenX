@@ -372,7 +372,7 @@ curl -s "http://localhost:8080/api/v1/wallet/ledger?limit=20" -H "Authorization:
 | `tokenx.order.timeout.interval` | `30s` | 两次触发的间隔（`fixedDelay`，从上次结束算起）；必须为正 |
 | `tokenx.order.timeout.max-orders-per-run` | `100` | 单次触发最多领取/尝试多少笔订单（成功与失败均占一个名额）；必须为 `1..1000` |
 
-非法配置**启动失败**（间隔非正、批量非正或超过上限），不静默修正。
+非法配置**启动失败**（间隔非正、领取预算非正或超过上限），不静默修正。
 
 要点：
 

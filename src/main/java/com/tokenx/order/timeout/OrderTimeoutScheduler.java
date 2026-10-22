@@ -10,7 +10,7 @@ import org.springframework.stereotype.Component;
 /**
  * The trigger that makes the timeout scan happen without anyone asking.
  *
- * <p>It owns no business logic. It reads the configured batch size, calls
+ * <p>It owns no business logic. It reads the configured claim budget, calls
  * {@link OrderTimeoutService#closeExpiredOrders(int)} — which closes each order in its own
  * transaction — and logs a one-line summary. Anything worth alarming on is logged by the service;
  * an empty run is not logged at all, because "no expired order" is the normal state and not an

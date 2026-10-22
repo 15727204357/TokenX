@@ -35,9 +35,9 @@ import org.springframework.test.web.servlet.MvcResult;
  * separate connection and requiring the scan to return promptly with the <em>other</em> order closed.
  * Checking the SQL text would prove nothing; only the waiting behaviour does.
  *
- * <p>The second is that a batch is bounded. One trigger closes at most the configured number of
- * orders, so a backlog is worked down over several triggers instead of one transaction that locks a
- * whole range.
+ * <p>The second is that a run is bounded. One trigger may attempt at most the configured number
+ * of orders — a closure and a failed attempt each spend one of those slots — so a backlog is
+ * worked down over several triggers instead of one transaction that locks a whole range.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
