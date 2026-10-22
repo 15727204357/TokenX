@@ -39,15 +39,16 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
             .map(info -> info.getVersion().getVersion())
             .toList();
 
-    assertThat(applied).contains("1", "2", "3", "4", "5", "5.1", "6", "7", "8", "9");
+    assertThat(applied)
+        .contains("1", "2", "3", "4", "5", "5.1", "6", "7", "8", "9", "10", "11");
 
     assertThat(flyway.info().all())
         .as("no migration may be in a failed state")
         .noneMatch(info -> info.getState().isFailed());
 
     assertThat(flyway.info().current().getVersion().getVersion())
-        .as("F5 is the last migration: the schema ends at V9")
-        .isEqualTo("9");
+        .as("F8 is the last migration: the schema ends at V11")
+        .isEqualTo("11");
   }
 
   @Test
@@ -60,7 +61,7 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
   }
 
   @Test
-  void shouldContainTheAccountCatalogueActivityOrderAndWalletTables() throws SQLException {
+  void shouldContainTheAccountCatalogueActivityOrderWalletAndOutboxTables() throws SQLException {
     assertThat(existingTables())
         .contains(
             "app_user",
@@ -69,7 +70,9 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
             "seckill_activity",
             "activity_inventory",
             "purchase_order",
-            "token_ledger")
+            "token_ledger",
+            "outbox_event",
+            "processed_message")
         .doesNotContain("schema_probe");
   }
 

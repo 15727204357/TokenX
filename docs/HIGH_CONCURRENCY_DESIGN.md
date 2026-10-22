@@ -133,7 +133,13 @@ F9 必须新增 `seckill_request`，保存最终受理结果而不是替代订�
 
 ### 3.4 阶段 D：事务后事件（Kafka Outbox）
 
-支付完成后的通知、统计、对账等事件走另一类 Topic，例如 `tokenx.order-events.v1`。业务事务同时写 `outbox_event`，Publisher 再投递 Kafka，消费者用 `processed_message` 幂等。
+F8 先实现支付成功事实事件 `ORDER_PAID` v1。支付事务把事件和订单/库存/余额/账本变更一起写入 `outbox_event`；任何 Kafka 连接或发送都在提交后进行，因此 Broker 故障不会阻塞或回滚已完成的支付。若 Outbox 数据库写入本身失败，支付事务整体回滚，避免出现“已支付但事件永远不存在”。
+
+- Topic：`tokenx.order-events.v1`，Key=`orderNo`；payload 包含 `schemaVersion`、稳定 `eventId`、`eventType`、`orderNo`、订单类型、金额/额度快照和 `paidAt`。
+- Publisher 用短事务 `FOR UPDATE SKIP LOCKED` 领取最多 25 条并设置 lease，事务提交后才发送；单次 ACK 等待默认最多 3 秒。失败最多 5 次、指数退避 1–30 秒，之后投递 `tokenx.order-events.dlt.v1`。DLT 不可用时 Outbox 记录仍保留并重试。ACK 后本地状态更新丢失可造成重复消息，属于允许的 at-least-once 窗口。
+- Consumer 的并发默认 1，关闭自动 offset 提交，每条消息的唯一 receipt `(consumer_name,event_id)` 在 `processed_message` 的独立 MySQL 事务提交后才返回 listener 并提交 offset。重启重放由唯一键吸收；业务消费错误最多重试 3 次，随后发送到 DLT，DLT 失败时 offset 保持不前移。
+- 当前 F8 下游是可核查的支付事件 receipt。后续真实通知或统计逻辑应与 receipt 写入放进同一消费事务，或为下游效果另建幂等键；不得把外部 HTTP 调用放进数据库事务。
+- Spring Boot BOM 管理 Spring Kafka 4.1.1 与 Kafka Client 4.2.1；F8 已在隔离 Kafka Broker 4.3.1 上验证 API 协商。默认单节点副本数 1 只用于本地验证，部署环境需按 Broker 数调整复制因子和 ISR。
 
 这是“数据库事实向下游发布”的事件链路；阶段 C 是“准入命令进入订单 Worker”的命令链路。两者职责不同，不构成两个互相竞争的订单队列。订单创建主链路始终只用 Kafka，不用 Redis Stream。
 
@@ -178,6 +184,10 @@ tokenx:seckill:{activityId}:requests
 | 故障点 | 对外结果 | 恢复与正确性 |
 |---|---|---|
 | Redis 在活动详情缓存读取时不可用 | 最多 8 个并发、等待最多 20ms 回退 MySQL；名额耗尽 `503 ACTIVITY_READ_UNAVAILABLE` | 总入口另有并发上限，过载 `429 ACTIVITY_READ_CAPACITY_EXCEEDED`；恢复后重用缓存 |
+| Kafka 在支付提交后不可用 | 支付仍按 MySQL 事务结果成功；没有同步等待 Kafka | `outbox_event` 保留待发布事件，Publisher 有界退避重试，超过次数尝试 DLT；恢复后继续投递 |
+| Outbox Publisher 在 Broker ACK 后、标记已发布前崩溃 | 事件可能重复发送 | 稳定 `eventId` 与 `processed_message` 唯一键避免重复消费效果 |
+| Consumer 在 receipt 提交后、offset 提交前崩溃 | 消息会再次投递 | receipt 唯一键将重放当作已处理，再提交 offset |
+| Consumer 连续处理失败 / DLT 不可用 | 事件保留在当前 offset，或最终进入 DLT | 有限重试；DLT 发送失败不提交 offset，并保留错误可见性 |
 | Redis 在准入前不可用 | 阶段 B 可限量回退；阶段 C 异步接口返回 `503` | MySQL 仍正确；不静默改变 API 契约，并发闸门保护 DB |
 | Lua 已预留，Kafka 明确发送失败 | `503` | 比对 `requestId` 后补偿 Redis；补偿可重试 |
 | Lua 已预留，Kafka 结果不确定或进程崩溃 | 客户端未获得成功承诺 | 标记 `UNKNOWN`，由租约与 Kafka/MySQL 终态对账后再补偿；不能在结果不确定时立即释放额度 |

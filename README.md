@@ -2,7 +2,7 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5`、`F6`、`F7` 完成——最小可运行骨架、MySQL 迁移链路、
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5`、`F6`、`F7`、`F8` 完成——最小可运行骨架、MySQL 迁移链路、
 > Redis 连通性、数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
 > （管理员创建/上下架、游客游标分页列表与详情、公开列表页），秒杀活动配置与库存初始化
 > （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），**同步秒杀下单**
@@ -11,7 +11,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 > **模拟支付与钱包**（同一事务内订单转 `PAID` + 秒杀预占结转 + 余额入账 + 不可变流水，
 > 重复/并发支付只入账一次，余额与流水分页查询，订单页支付按钮与钱包页），以及**订单超时关闭**
 > （`FOR UPDATE SKIP LOCKED` 有界领取、每单一个短事务、秒杀预占归还可用库存、支付与关单只能有一个赢家）。
-> F7 活动热读缓存与同步链路保护已完成：公开详情使用有界 Redis Cache-Aside 与事务提交后代际失效；交易正确性继续由 MySQL 保证。Kafka 与秒杀准入依后续阶段实施。
+> F7 活动热读缓存与同步链路保护已完成：公开详情使用有界 Redis Cache-Aside 与事务提交后代际失效；交易正确性继续由 MySQL 保证。F8 事务后事件已完成：支付事务写入 Outbox，Kafka 异步发布、消费幂等和有限重试/DLT 已验证；F9 秒杀准入仍待后续实施。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -23,7 +23,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 | 构建 | Maven 3.9.x + Maven Wrapper（仓库内置 `mvnw`） |
 | 持久化 | MyBatis-Plus 3.5.17（boot4 starter）+ MySQL 9.7 + Flyway 12.4 |
 | 认证 | Spring Security 7 + Nimbus JWT（HS256，本地验签） |
-| 缓存 / 消息 | Redis 8.10.x（F7 活动公开详情缓存；不参与交易判定）/ Kafka 4.3.1（后续阶段接入） |
+| 缓存 / 消息 | Redis 8.10.x（F7 活动公开详情缓存；不参与交易判定）/ Kafka Broker 4.3.1（F8 事务后事件；F9 异步秒杀待实施） |
 | 前端 | React 19 + TypeScript 5.x + Vite + pnpm（`frontend/`） |
 
 各依赖的实际解析版本见 [docs/VERSION_LOCK.md](docs/VERSION_LOCK.md)。
@@ -31,7 +31,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 ## 环境要求
 
 - JDK 21（`java -version` 必须为 21）
-- MySQL 9.7.x、Redis 8.10.x 本机运行
+- MySQL 9.7.x、Redis 8.10.x 本机运行；Kafka 4.3.1 用于 F8/F9 消息链路
 - 无需预装 Maven，仓库自带 Wrapper
 - 前端：Node.js 26.9.x + pnpm 12.x（仅 `frontend/` 需要）
 
@@ -63,7 +63,7 @@ cp src/main/resources/application-local.yml.example src/main/resources/applicati
 ## 运行
 
 ```bash
-# 编译 + 全部测试（需要本机 MySQL 与 Redis 已启动）
+# 编译 + 全部测试（需要本机 MySQL、Redis 和隔离 Kafka 4.3.1 Broker）
 ./mvnw clean verify
 
 # 启动应用：JWT 签名密钥必须提供，否则应用拒绝启动（fail fast）
@@ -473,21 +473,46 @@ pnpm build
 
 F7 不缓存管理接口、下单校验或交易事实，不改变 API 成功响应结构，无数据库迁移。正式性能结果和 QPS 由 F10 使用固定负载口径测量。
 
+## 事务后事件（F8）
+
+模拟支付成功时，订单状态、库存结转、钱包余额、账本流水和 `ORDER_PAID` Outbox 事件在同一个 MySQL 事务提交。事务内不调用 Kafka；Kafka 不可用时支付仍可提交，Outbox 保留待发布记录。
+
+- Topic：`tokenx.order-events.v1`；Key 为稳定 `orderNo`；Schema `schemaVersion=1`，事件类型为 `ORDER_PAID`。
+- Outbox Publisher 以短事务领取最多 25 条记录，提交领取事务后才等待 Kafka ACK；默认最多等待 3 秒。最多尝试 5 次，指数退避从 1 秒增至上限 30 秒；失败事件进入 `tokenx.order-events.dlt.v1`。Kafka ACK 后进程崩溃可能造成重复发布，`eventId` 保持稳定，消费者以 `(consumer_name,event_id)` 唯一键去重。
+- Consumer 并发默认 1、每次最多拉取 25 条、关闭自动提交。消费记录在独立 MySQL 事务提交后才提交 Kafka offset；连续失败有限重试后进入 DLT。当前下游将收到的事件登记为幂等 receipt，`processed_message` 可核查每个消费者实际处理的事件。
+- 默认 Broker 地址 `127.0.0.1:9092`。测试使用 `TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS`（默认 `127.0.0.1:19092`）及 `tokenx.test.*` Topic；请使用独立测试 Broker 数据目录，测试不会清空或重置 Topic。
+- Spring Boot BOM 实际管理 Spring Kafka `4.1.1`、Kafka Client `4.2.1`；已在隔离的 Kafka Broker `4.3.1` 上验证 API 协商、发送、消费、重启、重复消息与 DLT。
+
+`TOKENX_KAFKA_BOOTSTRAP_SERVERS` 配置应用 Broker。其它 `TOKENX_MESSAGING_*`、`TOKENX_ORDER_EVENTS_*`、`TOKENX_OUTBOX_*` 和 `TOKENX_KAFKA_*` 参数及默认值见 `application.yml`。单节点默认 Topic 副本数为 1，仅用于本地开发；多 Broker 环境应将副本数设为 3 并核验集群容量。
+
+| 环境变量 | 默认值 | 用途 |
+|---|---:|---|
+| `TOKENX_KAFKA_BOOTSTRAP_SERVERS` | `127.0.0.1:9092` | 应用 Kafka 地址；Kafka 停机时支付可提交，Outbox 留待重试 |
+| `TOKENX_MESSAGING_KAFKA_ENABLED` / `_LISTENER_ENABLED` / `_OUTBOX_ENABLED` | `true` / `true` / `true` | Kafka Topic/Consumer、监听器和 Outbox 轮询开关 |
+| `TOKENX_ORDER_EVENTS_TOPIC` / `_DLT_TOPIC` / `_CONSUMER_GROUP` | `tokenx.order-events.v1` / `tokenx.order-events.dlt.v1` / `tokenx-order-events-v1` | 事件 Topic、死信 Topic、消费者组 |
+| `TOKENX_ORDER_EVENTS_PARTITIONS` / `_REPLICATION_FACTOR` / `_CONCURRENCY` | `1` / `1` / `1` | Topic 拓扑及 Consumer 并发；均有界且启动校验 |
+| `TOKENX_OUTBOX_BATCH_SIZE` / `_MAX_ATTEMPTS` / `_POLL_INTERVAL` / `_LEASE` | `25` / `5` / `1s` / `90s` | 领取批次、发送重试次数、轮询间隔与领取租约 |
+| `TOKENX_OUTBOX_RETRY_BASE_DELAY` / `_RETRY_MAX_DELAY` | `1s` / `30s` | Publisher 指数退避区间 |
+| `TOKENX_KAFKA_SEND_TIMEOUT` | `3s` | 单条 Producer 等待 Broker ACK 上限 |
+| `TOKENX_KAFKA_LISTENER_RETRY_DELAY` / `_LISTENER_RETRY_COUNT` | `250ms` / `3` | Consumer 有限重试；随后尝试 DLT |
+| `TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS` | `127.0.0.1:19092` | 集成测试使用的隔离 Broker 地址 |
+
 ## 数据库迁移
 
 - 迁移脚本位于 `src/main/resources/db/migration/`，命名 `V<版本>__<说明>.sql`。
 - 应用启动时由 Flyway 自动执行；**禁止**手工改已发布的迁移文件，也禁止用 ORM 自动建表覆盖。
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
   `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
-  `activity_inventory`（F3）、`V8` `purchase_order`（F4）、`V9` `token_ledger`（F5，当前版本）。
+  `activity_inventory`（F3）、`V8` `purchase_order`（F4）、`V9` `token_ledger`（F5）、
+  `V10` `outbox_event` 与 `V11` `processed_message`（F8，当前版本）。
 - **F4.5 没有新增迁移**：普通购买复用 `V8` 已建好的 `order_type` / 可空 `activity_id` /
   `ck_order_activity`。**F6 同样没有新增迁移**：超时关闭只复用 `V8` 的
-  `idx_order_timeout(status, expires_at)`，schema 版本仍是 `V9`。
+  `idx_order_timeout(status, expires_at)`，schema 版本仍是 `V9`；F8 从 V9 追加 V10/V11，不修改任何已应用迁移。
 - **V9 只建 `token_ledger`**：`uk_ledger_biz(biz_type,biz_id,effect_type)` 是重复入账的第二道防线，
   `idx_ledger_user(user_id)` 服务按用户降序游标翻页；3 条 CHECK 固定业务/效果枚举并要求
   `delta` 的符号与 `effect_type` 一致（0 变动不接受）。V1–V8/V5.1 一个字都没改。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V9 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V11 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥
@@ -495,8 +520,9 @@ F7 不缓存管理接口、下单校验或交易事实，不改变 API 成功响
 - 默认配置在 `src/main/resources/application.yml`，**不包含任何真实密码或密钥**。
 - 本地覆盖配置放在 `application-local.yml`（已忽略），或通过 `TOKENX_DB_USERNAME` /
   `TOKENX_DB_PASSWORD` / `TOKENX_JWT_SECRET` / `TOKENX_JWT_TTL` /
-  `TOKENX_ORDER_PAYMENT_TIMEOUT` 环境变量注入。F7 缓存和背压参数使用
-  `TOKENX_ACTIVITY_CACHE_*` 环境变量；默认值及具体名称见 `src/main/resources/application.yml`。
+  `TOKENX_ORDER_PAYMENT_TIMEOUT`、`TOKENX_KAFKA_BOOTSTRAP_SERVERS` 环境变量注入。F7 缓存和背压参数使用
+  `TOKENX_ACTIVITY_CACHE_*`；F8 Outbox/Kafka 参数使用 `TOKENX_MESSAGING_*`、`TOKENX_ORDER_EVENTS_*`、
+  `TOKENX_OUTBOX_*` 与 `TOKENX_KAFKA_*` 环境变量；默认值及具体名称见 `src/main/resources/application.yml`。
 - `tokenx.auth.jwt.secret` 少于 32 字符时应用启动失败：这是有意的，避免用弱密钥或空密钥上线。
 - `tokenx.order.payment-timeout`（默认 `15m`）必须为正且不超过 `24h`，否则应用启动失败：
   “永不过期”的订单比启动失败更糟。该值在创建订单时固化进 `expires_at`。
@@ -521,6 +547,8 @@ src/main/java/com/tokenx/
 │   └── timeout/                    F6 超时关闭：有界扫描 + 每单一个短事务 + 调度触发
 ├── payment/                        F5 模拟支付：状态闸门、库存结转、入账事务
 │   ├── controller/  service/
+├── messaging/                      F8 事务后事件：Outbox、Kafka 发布/消费、幂等与重试
+│   ├── config/  mapper/  model/  service/
 ├── wallet/                         F5 钱包：余额查询、不可变流水与游标分页
 │   ├── controller/  service/  mapper/  model/  dto/
 └── infrastructure/                 通用基础设施（安全、异常转换、时间源、外部适配）

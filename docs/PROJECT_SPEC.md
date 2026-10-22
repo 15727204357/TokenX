@@ -24,6 +24,7 @@
 - F7 仅为 `GET /api/v1/activities/{id}` 建立 Redis Cache-Aside 公开快照缓存；`runtimeStatus` 每次由注入的 `Clock` 计算，库存字段只是展示快照。秒杀下单正确性仍只依赖 MySQL 条件更新和唯一键。缓存具有正/负缓存、TTL 抖动和提交后主动失效；Redis 故障只允许经有界并发闸门回退 MySQL。该读缓存与后续 Redis Lua 准入是两个不同用途。
 - 后续 Redis Lua 抢购准入仍以 Redis 为快路径、MySQL 为最终库存与资格权威。
 - Kafka 作为唯一异步下单队列；Transactional Outbox 只用于数据库事务后的下游事件。**不使用 Redis Stream 作为第二条订单队列。**
+- F8 已为支付成功建立 `ORDER_PAID` v1 事件：支付事务写 `outbox_event`，Publisher 提交领取事务后发布到 `tokenx.order-events.v1`（Key=`orderNo`），消费者在独立 MySQL 事务写入唯一 `(consumer_name,event_id)` receipt 后再提交 Kafka offset；重复投递按至少一次语义幂等处理。
 - 简单限流、指标采集、压测和同步/异步方案对比。
 - Redis Stream 只作为黑马点评参考实现的研究对象，不进入 TokenX 订单链路。
 

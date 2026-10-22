@@ -8,7 +8,7 @@
 2. **唯一例外**：MyBatis-Plus 不在 Boot BOM 内，因此 `mybatis-plus.version` 是本项目唯一显式固定的第三方版本。
 3. **禁止 `latest`/版本区间**：核心组件必须是精确版本，升级需单独评审（`PROJECT_SPEC.md` §2）。
 
-## 实际解析结果（2026-10-20，`./mvnw dependency:tree` 实测）
+## 实际解析结果（基础版本 2026-10-20；F8 消息依赖 2026-10-22，`./mvnw dependency:tree` 实测）
 
 | 组件 | 引入方式 | 实际解析版本 |
 |---|---|---|
@@ -23,6 +23,8 @@
 | Flyway（core + mysql） | BOM | 12.4.0 |
 | Spring Data Redis | BOM | 4.1.1 |
 | Lettuce | BOM | 7.5.2.RELEASE |
+| Spring Kafka | Spring Boot BOM | 4.1.1 |
+| kafka-clients | Spring Boot BOM | 4.2.1 |
 | Spring Security（F1 引入） | BOM | 7.1.1 |
 | spring-security-oauth2-jose（F1 引入） | BOM | 7.1.1 |
 | nimbus-jose-jwt（JWT 编解码） | Spring Security 传递 | 10.9.1 |
@@ -41,13 +43,13 @@
 | Maven | Wrapper 3.9.16 | 仓库内 `./mvnw` |
 | MySQL Server | 9.7.2 | 应用走专用账号，`root` 只用于建库 |
 | Redis Server | 8.10.2 | 本机无密码，仅回环地址 |
-| Kafka Broker | 4.3.1（KRaft） | **V1.5 才接入**，当前不在 classpath |
+| Kafka Broker | 4.3.1（KRaft） | F8 隔离本机 Broker，供事务后事件集成验证 |
 
-## Kafka 客户端版本（仅登记，未接入代码）
+## Kafka 客户端版本（F8 已接入）
 
-- `kafka-clients` 由 BOM 固定为 **4.2.1**，`spring-kafka` 为 **4.1.1**。
+- `spring-kafka` 由 Spring Boot BOM 固定为 **4.1.1**，`kafka-clients` 固定为 **4.2.1**。
 - Broker 为 4.3.1，客户端 4.2.1：`PROJECT_SPEC.md` §2 明确“不要求客户端同 Broker 小版本”，故不手工对齐，也不手写 Kafka 版本号。
-- 接入前（F8）须单独做连通性验证并补一次本表记录。
+- F8 已在隔离的单节点 Broker 上验证 API 协商、发布、消费和 DLT；测试不清理或重置 Topic。
 
 ## 前端依赖（F1 引入，`frontend/pnpm-lock.yaml` 固定）
 

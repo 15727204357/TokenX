@@ -75,6 +75,11 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-data-redis</artifactId>
     </dependency>
+    <!-- F8: post-transaction business events; versions remain managed by the Boot BOM. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-kafka</artifactId>
+    </dependency>
 
     <!-- Boot 4 splits test support per technology; this brings starter-test plus MockMvc support. -->
     <dependency>

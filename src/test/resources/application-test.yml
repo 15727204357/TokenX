@@ -20,7 +20,16 @@ spring:
     # Tests must fail loudly instead of silently migrating the wrong database.
     clean-disabled: true
 
+  kafka:
+    bootstrap-servers: ${TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:19092}
+    listener:
+      auto-startup: false
+
 tokenx:
+  messaging:
+    kafka-enabled: false
+    listener-enabled: false
+    outbox-enabled: false
   order:
     timeout:
       # No background trigger in tests: a scheduler thread could close the very rows a test is

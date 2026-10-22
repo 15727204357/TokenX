@@ -35,6 +35,31 @@ spring:
       connect-timeout: ${TOKENX_ACTIVITY_CACHE_REDIS_CONNECT_TIMEOUT:500ms}
       timeout: ${TOKENX_ACTIVITY_CACHE_REDIS_COMMAND_TIMEOUT:500ms}
 
+  kafka:
+    bootstrap-servers: ${TOKENX_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    admin:
+      fail-fast: false
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 5000
+        request.timeout.ms: 3000
+        max.block.ms: 2000
+        buffer.memory: 33554432
+    consumer:
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 25
+      auto-offset-reset: earliest
+    listener:
+      ack-mode: record
+      concurrency: 1
+      auto-startup: ${TOKENX_KAFKA_LISTENER_ENABLED:true}
+
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
@@ -84,6 +109,26 @@ tokenx:
       # of closures. Bounded on purpose: each order is its own transaction, and an unbounded batch
       # would hold locks for an unbounded time. Must be 1..1000.
       max-orders-per-run: ${TOKENX_ORDER_TIMEOUT_MAX_ORDERS_PER_RUN:100}
+
+  messaging:
+    kafka-enabled: ${TOKENX_MESSAGING_KAFKA_ENABLED:true}
+    listener-enabled: ${TOKENX_MESSAGING_LISTENER_ENABLED:true}
+    outbox-enabled: ${TOKENX_MESSAGING_OUTBOX_ENABLED:true}
+    order-events-topic: ${TOKENX_ORDER_EVENTS_TOPIC:tokenx.order-events.v1}
+    order-events-dlt-topic: ${TOKENX_ORDER_EVENTS_DLT_TOPIC:tokenx.order-events.dlt.v1}
+    consumer-group-id: ${TOKENX_ORDER_EVENTS_CONSUMER_GROUP:tokenx-order-events-v1}
+    topic-partitions: ${TOKENX_ORDER_EVENTS_PARTITIONS:1}
+    topic-replication-factor: ${TOKENX_ORDER_EVENTS_REPLICATION_FACTOR:1}
+    listener-concurrency: ${TOKENX_ORDER_EVENTS_CONCURRENCY:1}
+    outbox-batch-size: ${TOKENX_OUTBOX_BATCH_SIZE:25}
+    outbox-max-attempts: ${TOKENX_OUTBOX_MAX_ATTEMPTS:5}
+    outbox-poll-interval: ${TOKENX_OUTBOX_POLL_INTERVAL:1s}
+    outbox-lease: ${TOKENX_OUTBOX_LEASE:90s}
+    retry-base-delay: ${TOKENX_OUTBOX_RETRY_BASE_DELAY:1s}
+    retry-max-delay: ${TOKENX_OUTBOX_RETRY_MAX_DELAY:30s}
+    send-timeout: ${TOKENX_KAFKA_SEND_TIMEOUT:3s}
+    listener-retry-delay: ${TOKENX_KAFKA_LISTENER_RETRY_DELAY:250ms}
+    listener-retry-count: ${TOKENX_KAFKA_LISTENER_RETRY_COUNT:3}
 
 server:
   port: 8080

@@ -252,7 +252,12 @@
 > 前端 `pnpm lint`、`pnpm test`（7 文件、58 测试）、`pnpm build`、`pnpm format:check` 全部通过；前端无需修改。
 > 没有进行正式压测或报告 QPS，F10 使用相同数据集、并发、到达率、时长、机器/JVM/连接池记录对照结果。
 
-### [ ] F8 事件模型与 Kafka Outbox
+### [x] F8 事件模型与 Kafka Outbox
+
+> 完成记录（2026-10-22，分支 `feature/F8-kafka-outbox`）：模拟支付在原有 MySQL 事务内写入版本化 `ORDER_PAID` Outbox；Kafka 发送发生在支付事务外。新增 `V10__create_outbox_event.sql` / `V11__create_processed_message.sql`，事件 Key 为 `orderNo`，稳定 UUID `eventId`，Topic `tokenx.order-events.v1`，Consumer receipt 使用 `(consumer_name,event_id)` 唯一键。
+> Publisher 以短事务领取最多 25 条，提交后等待 Broker ACK，单次等待默认 3s；最多 5 次指数退避（1–30s），后续投递 `tokenx.order-events.dlt.v1`。Consumer 并发默认 1、关闭自动提交，receipt 事务成功后提交 offset；消费失败有限重试后进 DLT，DLT 不可用时 offset 不前移。Kafka ACK 后进程崩溃的重复投递由幂等键吸收，不宣称跨系统 Exactly Once。
+> Spring Boot BOM 解析为 Spring Kafka 4.1.1 / Kafka Client 4.2.1；隔离临时 Broker 实测版本 4.3.1，API 协商、真实生产消费通过。故障测试用可控发送失败替身覆盖 Outbox 保留与恢复重试；消费者停止/重启、重复消息、poison record 有限重试与 DLT 均通过。没有修改秒杀下单链路、Redis Stream 或前端。
+> F8 新增 5 个真实 MySQL/Kafka 集成测试通过（支付提交/回滚 2，发布重试/消费者重启与重复消费/DLT 3）；完整 `./mvnw clean verify`：270 个测试通过，0 失败、0 错误、0 跳过。
 
 **范围**：先在一个低风险事务后事件（如订单支付完成后的异步通知/统计）中加入 Outbox + Kafka；定义版本化消息 Schema、Topic Key、Producer、Consumer、有限重试/DLT、幂等及 offset 提交时机。这是事务后事件链路，不承担秒杀下单命令。
 
@@ -286,4 +291,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5、F6 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F7。
+> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5、F6、F7、F8 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F9。

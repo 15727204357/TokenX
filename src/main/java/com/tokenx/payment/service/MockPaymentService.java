@@ -4,6 +4,7 @@ import com.tokenx.activity.mapper.ActivityInventoryMapper;
 import com.tokenx.auth.mapper.TokenAccountMapper;
 import com.tokenx.auth.model.TokenAccount;
 import com.tokenx.infrastructure.error.BusinessException;
+import com.tokenx.messaging.service.OrderPaidOutboxWriter;
 import com.tokenx.order.dto.OrderResponse;
 import com.tokenx.order.mapper.PurchaseOrderMapper;
 import com.tokenx.order.model.OrderStatus;
@@ -76,6 +77,7 @@ public class MockPaymentService {
   private final ActivityInventoryMapper inventoryMapper;
   private final TokenAccountMapper accountMapper;
   private final TokenLedgerMapper ledgerMapper;
+  private final OrderPaidOutboxWriter outboxWriter;
   private final Clock clock;
   private final TransactionTemplate writeTemplate;
 
@@ -84,12 +86,14 @@ public class MockPaymentService {
       ActivityInventoryMapper inventoryMapper,
       TokenAccountMapper accountMapper,
       TokenLedgerMapper ledgerMapper,
+      OrderPaidOutboxWriter outboxWriter,
       Clock clock,
       PlatformTransactionManager transactionManager) {
     this.orderMapper = orderMapper;
     this.inventoryMapper = inventoryMapper;
     this.accountMapper = accountMapper;
     this.ledgerMapper = ledgerMapper;
+    this.outboxWriter = outboxWriter;
     this.clock = clock;
     // Explicit boundary rather than @Transactional: the transaction body is the thing being
     // reviewed here, and it should be readable as one list of statements.
@@ -236,6 +240,7 @@ public class MockPaymentService {
     long balanceAfter = account.getAvailableBalance();
     ledgerMapper.insert(
         TokenLedger.orderCredit(userId, order.getId(), creditAmount, balanceAfter, now));
+    outboxWriter.record(order, now);
     return balanceAfter;
   }
 

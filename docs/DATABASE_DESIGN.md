@@ -11,7 +11,7 @@
 
 | # | 决策 | 结论 |
 |---|---|---|
-| 1 | 表数量 | **7 张**：`app_user`、`token_package`、`seckill_activity`、`activity_inventory`、`purchase_order`、`token_account`、`token_ledger` |
+| 1 | V1 核心表数量 | **7 张**：`app_user`、`token_package`、`seckill_activity`、`activity_inventory`、`purchase_order`、`token_account`、`token_ledger`；F8 追加 2 张消息可靠性表 |
 | 2 | 活动配置与库存 | **分表**，理由是写频率隔离，不是为了"看起来规范"（见 §4.4） |
 | 3 | 普通购买与秒杀订单 | **共用 `purchase_order`**；`activity_id` 可空 + `order_type` 区分。**已定方案 B**：接口与 Service 分开，表共用（§15） |
 | 4 | 库存已售量 `sold_stock` | **不落库**，由 `total - available - reserved` 计算 |
@@ -198,7 +198,7 @@ erDiagram
 |---|---|---|---|
 | `purchase_qualification` | **不建** | `UNIQUE(activity_id,user_id)` 已唯一表达"一人一单"，再建一张表等于同一事实存两份，必然出现不一致 | 若将来要记录"参与但未中签"的抽签结果，才需要独立资格表 |
 | `payment_record` | **不建** | V1 是模拟支付，没有任何外部支付单号/回调报文要落库；状态已在订单上 | 接入真实网关时建 `payment_transaction`（外部单号唯一、回调幂等） |
-| `outbox_event` / `processed_message` | **不建** | 当前没有独立下游消费者；引入只会增加一个必须与业务同事务写的热点表 | V1.5 有真实独立下游事件时（F8） |
+| `outbox_event` / `processed_message` | **F8 已建** | 支付成功事实需要可靠投递给独立下游；Outbox 与支付同事务，消费 receipt 唯一约束承接至少一次投递 | F8；F9 秒杀命令链路不使用这两张表 |
 | `seckill_request` | **不建** | 同步链路里"请求"与"订单"是同一件事；只有当"受理"与"落单"分离（C 阶段）才有独立价值 | C 阶段且需要跨重启查排队状态时（§8.2） |
 | `schema_probe` | **F1 拆除** | F0-2 的连通性探针，不是业务表 | 随 `V3` 迁移一并删除 |
 
@@ -820,9 +820,14 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 
 注意：这张表不参与 API 入口同步写入，否则会把每个洪峰请求重新压到 MySQL。系统只在 Kafka ACK 后承诺“已受理”，Consumer 处理后落最终结果；Redis 状态丢失时必须显示 `PROCESSING/RECOVERING`，不能伪造失败。
 
-### 8.3 D 阶段：`outbox_event` / `processed_message`
+### 8.3 D 阶段：`outbox_event` / `processed_message`（F8 已实现）
 
-仅在出现**独立下游**（通知、统计、对账系统）时引入。`outbox_event` 与业务写入同事务提交，Publisher 异步投递，消费者靠 `processed_message` 幂等。它发布的是订单事实事件，与 F9 的秒杀命令 Topic 职责不同。**V1 不建**：没有消费者时它只是一个多写的热点表。
+- `outbox_event` 保存支付成功后事件：稳定 `event_id`（BINARY UUID）、聚合类型/编号、事件类型、Schema 版本、Kafka Key、JSON payload、状态、尝试次数、下次重试时间、租约、发布时间和不含异常详情的错误类别。`(status,next_attempt_at,id)` 支持有界领取；`event_id` 唯一保证数据库内事件标识稳定。
+- `processed_message` 以 `(consumer_name,event_id)` 唯一，记录消费成功时间。当前 F8 receipt consumer 将持久化 receipt 作为下游效果，供对账和重放核查。
+- 模拟支付只有在首次赢得订单状态闸门、写完库存结转/余额/账本后才在同一 MySQL 事务插入 `ORDER_PAID` v1 Outbox。事务提交后 Publisher 用短事务领取有界批次并设置租约，提交领取事务后等待 Kafka ACK；任何 Kafka 调用都不在支付事务或领取事务内。
+- Publisher 对发送失败按配置指数退避，最多 5 次后发到 `tokenx.order-events.dlt.v1`。若 DLT 也不可用，记录仍留在 Outbox 并继续延迟重试。Kafka ACK 后 DB 更新失败或进程崩溃可能导致重复发送，消费者以稳定 `event_id` 和唯一约束吸收。
+- Consumer 每条消息先提交独立 MySQL receipt 事务，listener 返回后才由 RECORD ack mode 提交 Kafka offset。DB 提交后、offset 提交前崩溃会重复投递，但唯一 receipt 阻止重复处理。Consumer 失败有限重试后投递 DLT；DLT 发送失败时 offset 不前移。
+- Outbox 事件是数据库中的支付事实，不是 F9 秒杀命令；事件交付为至少一次，不宣称 Kafka/MySQL 跨系统 Exactly Once。
 
 ### 8.4 真实支付接入
 
@@ -889,10 +894,10 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V11 | `V11__create_processed_message.sql` | F8 | 独立下游消费幂等 |
 | V12 | `V12__create_seckill_request.sql` | F9 | 异步秒杀最终请求结果 |
 
-> 截至 F5：V1～V9 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
+> 截至 F8：V1～V11 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
 > 唯一键、CHECK、`NULL activity_id` 的唯一键语义、流水的方向/符号 CHECK、重复 migrate 零变更，
-> 当前 schema 版本 = V9）；V10 及以后属于后续任务。
-> F4.5 只加代码不加列，未新增迁移；F5 新增的 V9 只建 `token_ledger`，不改动 V1–V8/V5.1。
+> 当前 schema 版本 = V11；V12 及以后属于后续任务。
+> F4.5 只加代码不加列；F5 新增 V9 `token_ledger`；F8 追加 V10/V11，不改动 V1–V9/V5.1。
 
 ### 11.2 规则
 
