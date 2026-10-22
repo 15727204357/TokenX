@@ -199,7 +199,7 @@ erDiagram
 | `purchase_qualification` | **不建** | `UNIQUE(activity_id,user_id)` 已唯一表达"一人一单"，再建一张表等于同一事实存两份，必然出现不一致 | 若将来要记录"参与但未中签"的抽签结果，才需要独立资格表 |
 | `payment_record` | **不建** | V1 是模拟支付，没有任何外部支付单号/回调报文要落库；状态已在订单上 | 接入真实网关时建 `payment_transaction`（外部单号唯一、回调幂等） |
 | `outbox_event` / `processed_message` | **F8 已建** | 支付成功事实需要可靠投递给独立下游；Outbox 与支付同事务，消费 receipt 唯一约束承接至少一次投递 | F8；F9 秒杀命令链路不使用这两张表 |
-| `seckill_request` | **不建** | 同步链路里"请求"与"订单"是同一件事；只有当"受理"与"落单"分离（C 阶段）才有独立价值 | C 阶段且需要跨重启查排队状态时（§8.2） |
+| `seckill_request` | **F9 已建** | 异步受理与 MySQL 最终落单分离，需要跨重启查询最终状态；不取代 `purchase_order` | 不适用 |
 | `schema_probe` | **F1 拆除** | F0-2 的连通性探针，不是业务表 | 随 `V3` 迁移一并删除 |
 
 ---
@@ -207,6 +207,12 @@ erDiagram
 ## 4. 逐表设计
 
 > 通用约定：字符集 `utf8mb4` / 排序规则 `utf8mb4_0900_ai_ci`（`request_id`、`order_no` 用 `ascii_bin`）；时间统一 `DATETIME(3)` 存 **UTC**（连接参数已设 `connectionTimeZone=UTC`）；金额与额度一律整数最小单位，禁止浮点。
+
+### `seckill_request`（F9）
+
+`V12` 新建请求结果表，`V13` 扩展 `UNKNOWN`，`V14` 扩展 `RESERVED` 状态约束。`request_id BINARY(16)` 全局唯一并与 `(user_id,request_id)` 唯一键共同兜底；`activity_id/user_id` 支持恢复及查询。`status`：`0 QUEUED`、`1 PROCESSING`、`2 ORDERED`、`3 REJECTED`、`4 FAILED`、`5 UNKNOWN`、`6 RESERVED`；`ORDERED` 必须关联 `order_id`，业务拒绝/死信保存稳定 `error_code`。`RESERVED/UNKNOWN` 对外查询都映射为 `PROCESSING`。表只记录请求收敛状态；库存和订单的权威数据仍在 `activity_inventory/purchase_order`。
+
+异步入口先持久化 `RESERVED` 请求意图再发送 Kafka，只有 Broker ACK 后改为 `QUEUED` 并返回 `202`。发送明确失败时删除未 ACK 行并执行按 requestId 幂等的 Redis 补偿；发送结果超时记为 `UNKNOWN`，不提前释放额度。超过 30 秒仍未确认的 `RESERVED/UNKNOWN` 行由后台恢复任务用相同 requestId 重发，重复命令由数据库幂等约束收敛；仍不能收敛时需人工核对 Kafka offset。Worker 先独立标记 `PROCESSING`，再把订单、条件库存更新和终态写在同一事务；事务成功后才允许提交 Kafka offset。Redis key 丢失后的重建必须暂停准入，以 `available_stock - 非终态请求数` 计算 quota 并恢复未完成用户标记；存在 `UNKNOWN` 时拒绝重建，需先按 Kafka offset 人工对账。
 
 ### 4.1 `app_user` —— 账号主体
 
@@ -773,7 +779,7 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | 视角 | 分析 |
 |---|---|
 | 请求链路 | HTTP → Lua 原子准入并标记 `RESERVED` → Kafka Producer 等待 Broker ACK → 标记 `QUEUED` → 返回 `202 + requestId`；Worker 消费 → MySQL 条件更新 + 建单 → DB 提交后提交 offset |
-| DB 写入次数 | 请求路径 **0 次**；每个被受理请求由 Worker 在一个事务完成库存 UPDATE、订单 INSERT 与 `seckill_request` 终态 INSERT/UPDATE |
+| DB 写入次数 | 每个受理请求先 INSERT `RESERVED` 意图，Broker ACK 后更新 `QUEUED`；Worker 独立更新 `PROCESSING`，再在一个事务完成库存 UPDATE、订单 INSERT 与请求终态 UPDATE |
 | 事务边界 | Redis、Kafka、MySQL 三段之间没有原子事务；只有 Broker ACK 后才承诺“已受理”，只有 MySQL 提交后才是“已成单” |
 | 一致性风险 | Producer 超时结果不确定、至少一次重复消费、Redis 与 DB quota 漂移；用请求幂等、DB 唯一键、条件更新、租约补偿和对账收敛 |
 | 理论瓶颈 | Redis 单 key Lua、Kafka 单活动分区、Worker 落库速率与 MySQL 库存行 |
@@ -788,8 +794,8 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 |---|---|---|---|
 | 入口能力 | 低（每请求都进 DB） | 高 | 最高 |
 | 有效订单 TPS | 受库存行锁限制 | 同 A | 受 Worker 落库限制 |
-| DB 写入/成功单 | 2 写 | 2 写 | 2 个业务写 + 1 个请求终态写 |
-| DB 写入/失败请求 | 1 写 | 0 | 0 |
+| DB 写入/成功单 | 2 写 | 2 写 | 请求意图 INSERT、ACK 状态更新、Worker PROCESSING 更新，以及库存 UPDATE、订单 INSERT、请求终态 UPDATE |
+| DB 写入/失败请求 | 1 写 | 0 | 受理前业务拒绝不写请求表；ACK 后业务拒绝会保存请求终态，发送明确失败会删除未 ACK 意图 |
 | 一致性模型 | 强（单库事务） | 最终事实强一致（Redis 仅准入） | 最终一致（需补偿、幂等、对账） |
 | 新增表 | 无 | 无 | 必须 `seckill_request` |
 | 实现成本 | 最低 | 中（Lua + 缓存失效） | 高（幂等、补偿、可观测） |
@@ -804,21 +810,21 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 
 ### 8.2 C 阶段：`seckill_request`（必须）
 
-异步受理与订单落库分离后，请求本身成为可查询对象。Redis 保存 `RESERVED/QUEUED` 快状态，Kafka Consumer 在 MySQL 保存最终结果：
+异步受理与订单落库分离后，请求本身成为可查询对象。Redis Lua 原子保存 gate 的额度、用户占用和 `RESERVED/QUEUED/UNKNOWN` 快状态；MySQL 的 `seckill_request` 保存可恢复的请求状态和最终结果：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | `BIGINT UNSIGNED` PK AI | |
 | `request_id` | `BINARY(16)` | 与 `user_id` 联合唯一，与订单幂等键一致 |
 | `activity_id` / `user_id` | `BIGINT UNSIGNED` | |
-| `status` | `TINYINT` | 1=ORDERED，2=REJECTED，3=FAILED；排队态主要在 Redis |
+| `status` | `TINYINT` | 0=QUEUED，1=PROCESSING，2=ORDERED，3=REJECTED，4=FAILED，5=UNKNOWN，6=RESERVED |
 | `order_id` | `BIGINT UNSIGNED` NULL | 落单后回填 |
 | `error_code` | `VARCHAR(64)` NULL | 拒绝/失败的稳定机器码，不存异常堆栈 |
 | `created_at` / `updated_at` | `DATETIME(3)` | |
 
-键：`UNIQUE(user_id,request_id)` 保证请求幂等；`KEY(activity_id,user_id,status)` 支持定位用户在活动中的请求。最终一人一单只由 `purchase_order.UNIQUE(activity_id,user_id)` 兜底，不能让一次系统级 `FAILED` 永久阻止用户重试。`ORDERED` 必须有 `order_id`，其他终态必须为空。
+键：`UNIQUE(user_id,request_id)` 与 `UNIQUE(request_id)` 保证请求幂等；`KEY(activity_id,user_id,status)` 支持恢复定位未完成请求。最终一人一单仍由 `purchase_order.UNIQUE(activity_id,user_id)` 兜底。`ORDERED` 必须有 `order_id`，`REJECTED/FAILED` 必须有稳定 `error_code`；`RESERVED/UNKNOWN` 对外都查询为 `PROCESSING`。V12 建表，V13/V14 追加状态约束，已应用迁移不回写。
 
-注意：这张表不参与 API 入口同步写入，否则会把每个洪峰请求重新压到 MySQL。系统只在 Kafka ACK 后承诺“已受理”，Consumer 处理后落最终结果；Redis 状态丢失时必须显示 `PROCESSING/RECOVERING`，不能伪造失败。
+请求路径先执行 Redis Lua 准入，再将 `RESERVED` 请求意图持久化到 MySQL，随后发送 Kafka 命令；只有 Broker ACK 后才将请求置为 `QUEUED` 并返回 `202`。这个短 MySQL 写用于覆盖应用在发送前崩溃的恢复边界，异步落单仍由 Worker 执行。Consumer 处理后写入最终结果；Redis 状态丢失时必须 fail-closed 并按 MySQL 可用库存及非终态请求重建，不能伪造失败。
 
 ### 8.3 D 阶段：`outbox_event` / `processed_message`（F8 已实现）
 
@@ -893,11 +899,13 @@ SELECT biz_id, COUNT(*) FROM token_ledger
 | V10 | `V10__create_outbox_event.sql` | F8 | 事务后事件 Outbox |
 | V11 | `V11__create_processed_message.sql` | F8 | 独立下游消费幂等 |
 | V12 | `V12__create_seckill_request.sql` | F9 | 异步秒杀最终请求结果 |
+| V13 | `V13__allow_ambiguous_seckill_request.sql` | F9 | 允许 `UNKNOWN` 状态 |
+| V14 | `V14__add_reserved_seckill_request_status.sql` | F9 | 允许 Broker ACK 前 `RESERVED` 状态 |
 
-> 截至 F8：V1～V11 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
+> 截至 F9：V1～V14 已在本地开发库与测试库执行并通过真实 MySQL 集成测试（列类型、排序规则、索引列序、
 > 唯一键、CHECK、`NULL activity_id` 的唯一键语义、流水的方向/符号 CHECK、重复 migrate 零变更，
-> 当前 schema 版本 = V11；V12 及以后属于后续任务。
-> F4.5 只加代码不加列；F5 新增 V9 `token_ledger`；F8 追加 V10/V11，不改动 V1–V9/V5.1。
+> 当前 schema 版本 = V14。
+> F4.5 只加代码不加列；F5 新增 V9 `token_ledger`；F8 追加 V10/V11；F9 追加 V12–V14，不改动已有版本。
 
 ### 11.2 规则
 

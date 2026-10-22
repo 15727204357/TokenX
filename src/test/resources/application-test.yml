@@ -30,6 +30,7 @@ tokenx:
     kafka-enabled: false
     listener-enabled: false
     outbox-enabled: false
+    seckill-listener-enabled: false
   order:
     timeout:
       # No background trigger in tests: a scheduler thread could close the very rows a test is

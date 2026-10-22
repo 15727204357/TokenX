@@ -11,7 +11,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 > **模拟支付与钱包**（同一事务内订单转 `PAID` + 秒杀预占结转 + 余额入账 + 不可变流水，
 > 重复/并发支付只入账一次，余额与流水分页查询，订单页支付按钮与钱包页），以及**订单超时关闭**
 > （`FOR UPDATE SKIP LOCKED` 有界领取、每单一个短事务、秒杀预占归还可用库存、支付与关单只能有一个赢家）。
-> F7 活动热读缓存与同步链路保护已完成：公开详情使用有界 Redis Cache-Aside 与事务提交后代际失效；交易正确性继续由 MySQL 保证。F8 事务后事件已完成：支付事务写入 Outbox，Kafka 异步发布、消费幂等和有限重试/DLT 已验证；F9 秒杀准入仍待后续实施。
+> F7 活动热读缓存与同步链路保护已完成：公开详情使用有界 Redis Cache-Aside 与事务提交后代际失效；交易正确性继续由 MySQL 保证。F8 事务后事件已完成：支付事务写入 Outbox，Kafka 异步发布、消费幂等和有限重试/DLT 已验证。F9 增加 Redis 准入与 Kafka 异步下单链路。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -23,7 +23,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 | 构建 | Maven 3.9.x + Maven Wrapper（仓库内置 `mvnw`） |
 | 持久化 | MyBatis-Plus 3.5.17（boot4 starter）+ MySQL 9.7 + Flyway 12.4 |
 | 认证 | Spring Security 7 + Nimbus JWT（HS256，本地验签） |
-| 缓存 / 消息 | Redis 8.10.x（F7 活动公开详情缓存；不参与交易判定）/ Kafka Broker 4.3.1（F8 事务后事件；F9 异步秒杀待实施） |
+| 缓存 / 消息 | Redis 8.10.x（F7 活动公开详情缓存、F9 准入）/ Kafka Broker 4.3.1（F8 事务后事件、F9 异步秒杀） |
 | 前端 | React 19 + TypeScript 5.x + Vite + pnpm（`frontend/`） |
 
 各依赖的实际解析版本见 [docs/VERSION_LOCK.md](docs/VERSION_LOCK.md)。
@@ -495,7 +495,25 @@ F7 不缓存管理接口、下单校验或交易事实，不改变 API 成功响
 | `TOKENX_OUTBOX_RETRY_BASE_DELAY` / `_RETRY_MAX_DELAY` | `1s` / `30s` | Publisher 指数退避区间 |
 | `TOKENX_KAFKA_SEND_TIMEOUT` | `3s` | 单条 Producer 等待 Broker ACK 上限 |
 | `TOKENX_KAFKA_LISTENER_RETRY_DELAY` / `_LISTENER_RETRY_COUNT` | `250ms` / `3` | Consumer 有限重试；随后尝试 DLT |
-| `TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS` | `127.0.0.1:19092` | 集成测试使用的隔离 Broker 地址 |
+| `TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS` | `127.0.0.1:19092` | 集成测试 Broker 地址；测试使用专用 `tokenx.test.*` Topic，不删除 Topic 或重置数据 |
+
+## Redis 准入与异步秒杀（F9）
+
+`tokenx.seckill.mode=SYNC|ASYNC`（环境变量 `TOKENX_SECKILL_MODE`，默认 `SYNC`）控制秒杀写入口。`SYNC` 只开放原有 `POST /activities/{id}/orders`；`ASYNC` 只开放下述受理接口。模式切换是运维变更，需让所有应用实例使用同一模式后再开放流量。普通购买、支付、关单接口不受此开关影响。
+
+| 方法 | 路径 | 成功语义 | 说明 |
+|---|---|---|---|
+| POST | `/api/v1/activities/{id}/order-requests` | `202 {requestId,status:"QUEUED"}` | 仅 Kafka Broker ACK 后返回；必须提供规范 UUID `Idempotency-Key`。202 表示已受理，不代表已创建订单。 |
+| GET | `/api/v1/order-requests/{requestId}` | `200 {requestId,status,orderNo,errorCode}` | 只返回当前用户的请求；状态为 `QUEUED`、`PROCESSING`、`ORDERED`、`REJECTED` 或 `FAILED`；只有 `ORDERED` 有 `orderNo`。 |
+| POST | `/api/v1/admin/activities/{id}/admission/rebuild` | `200` | 管理员运维接口：暂停准入后按 MySQL `available_stock` 和未完成请求重建 Redis gate。遇到未确认 Kafka 发送时返回 `409`，需先按 broker offset 对账。 |
+
+准入 Lua 以活动 hash tag 的 `gate/users/requests` 三个键原子执行活动状态检查、请求幂等、用户限购与额度预留。数据库先持久化 `RESERVED` 请求意图，Producer 用活动 ID 作 Kafka record key 并等待 ACK；只有收到 ACK 后才将记录标为 `QUEUED` 并返回 `202`。明确失败时删除未 ACK 请求、按 requestId 重复安全补偿并返回稳定 `503`；同一键可安全重试。发送结果超时或不确定时保存 `UNKNOWN`、暂停该活动并返回 `503`，不得立即释放可能已入 Kafka 的额度。查询把 `RESERVED/UNKNOWN` 映射为 `PROCESSING`。后台每 5 秒检查超过 30 秒的 `RESERVED/UNKNOWN` 意图并用相同 requestId 重发；ACK 后转为 `QUEUED`，重复消息由 Worker 幂等吸收。若不确定请求仍无法收敛，重建接口返回 `409`，需人工核对 Broker 记录与 offset。订单命令 Topic 为 `tokenx.seckill-order-commands.v1`，DLT 为 `tokenx.seckill-order-commands.dlt.v1`。默认 8 个分区、8 个 Consumer 并发；`TOKENX_SECKILL_ORDER_PARTITIONS` / `TOKENX_SECKILL_ORDER_CONCURRENCY` 可配置，启动时校验并发不超过分区数。同活动按分区有序，不同活动可并行。
+
+主要配置：`TOKENX_SECKILL_MODE`（默认 `SYNC`）、`TOKENX_SECKILL_ADMISSION_TTL`（默认 `48h`）、`TOKENX_SECKILL_ORDER_PARTITIONS` / `TOKENX_SECKILL_ORDER_CONCURRENCY`（默认 `8/8`）、`TOKENX_SECKILL_RECOVERY_INTERVAL`（默认 `5s`）、`TOKENX_KAFKA_SEND_TIMEOUT`（默认 `3s`）及 Kafka Topic、Consumer Group、监听器开关。ASYNC 部署需保持命令与 DLT Topic 分区数一致，`acks=all`；生产集群还需按高可用要求配置多副本和 `min.insync.replicas`。
+
+Worker 先将请求标为 `PROCESSING`，再在一个 MySQL 事务中写订单、条件扣库存与 `seckill_request` 终态；事务提交后由 Kafka record listener 提交 offset（至少一次语义）。重复投递由唯一请求键、订单一人一单唯一约束及条件库存更新吸收。MySQL 暂时不可用时消费重试保持 offset 不前移；业务拒绝写稳定错误码；不可处理命令进入 DLT 并标记 `FAILED`。Redis 不保存订单或库存事实。V14 的 `RESERVED` 状态支持区分 Broker ACK 前的持久化请求意图。
+
+Redis 重启或准入 key 缺失时入口 fail-closed，活动须重建后再开放。重建基于 MySQL 可用库存和未完成请求，不按总库存初始化；`UNKNOWN` 请求会阻止重建，运维必须先核查 Kafka 记录与 offset 再处置。Kafka 故障时不回退同步下单。默认分区和副本设置继承 `tokenx.messaging.topic-partitions` 与 `topic-replication-factor`；单 Broker 仅用于功能验证，不能代表高可用。积压监控、正式性能比较和故障注入留给 F10。
 
 ## 数据库迁移
 
@@ -504,15 +522,17 @@ F7 不缓存管理接口、下单校验或交易事实，不改变 API 成功响
 - 已应用：`V1` 探针表、`V2` 删除探针表、`V3` `app_user`、`V4` `token_account`（F1）、
   `V5` `token_package`、`V5.1` 套餐金额上限 CHECK（F2）、`V6` `seckill_activity`、`V7`
   `activity_inventory`（F3）、`V8` `purchase_order`（F4）、`V9` `token_ledger`（F5）、
-  `V10` `outbox_event` 与 `V11` `processed_message`（F8，当前版本）。
+  `V10` `outbox_event` 与 `V11` `processed_message`（F8）、`V12` `seckill_request` 与
+  `V13` `UNKNOWN` 与 `V14` `RESERVED` 状态约束扩展（F9，当前版本）。
 - **F4.5 没有新增迁移**：普通购买复用 `V8` 已建好的 `order_type` / 可空 `activity_id` /
   `ck_order_activity`。**F6 同样没有新增迁移**：超时关闭只复用 `V8` 的
   `idx_order_timeout(status, expires_at)`，schema 版本仍是 `V9`；F8 从 V9 追加 V10/V11，不修改任何已应用迁移。
 - **V9 只建 `token_ledger`**：`uk_ledger_biz(biz_type,biz_id,effect_type)` 是重复入账的第二道防线，
   `idx_ledger_user(user_id)` 服务按用户降序游标翻页；3 条 CHECK 固定业务/效果枚举并要求
   `delta` 的符号与 `effect_type` 一致（0 变动不接受）。V1–V8/V5.1 一个字都没改。
+- **F9 请求表迁移**：V12 新建请求结果/幂等记录，V13 为不确定投递结果增加 `UNKNOWN`，V14 为 Broker ACK 前的持久化意图增加 `RESERVED`；已应用迁移保持不变。
 - **从零空库验证**需要空 schema：应用账号没有 `CREATE/DROP DATABASE` 权限，因此该验证由人工执行
-  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V11 +
+  （`docs/DEVELOPMENT_PLAN.md` F1 记录中给出了确切命令）；自动化测试覆盖的是「升级到 V14 +
   重复 migrate 不重复建对象 + 索引/约束/排序规则真实生效」。
 
 ## 配置与密钥

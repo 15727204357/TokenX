@@ -109,8 +109,9 @@ Kafka topic (key = activityId)
 - `POST /api/v1/activities/{activityId}/order-requests` 接收规范 UUID 格式的 `Idempotency-Key`。
 - 部署配置 `tokenx.seckill.mode=SYNC|ASYNC` 决定唯一公开写入口：`SYNC` 只开放 V1 的 `/activities/{id}/orders`，`ASYNC` 只开放上述受理接口。禁止同一环境同时开放两条秒杀写入口绕过 Redis gate；切换模式是显式运维动作，不在依赖故障时自动切换。
 - 只有 Kafka Broker 确认写入后才返回 `202`；Redis 准入成功但 Kafka 发送失败时执行补偿并返回 `503`。
-- `GET /api/v1/order-requests/{requestId}` 只能查询当前用户自己的 `QUEUED/PROCESSING/ORDERED/REJECTED/FAILED`，`ORDERED` 返回 `orderNo`。
+- `GET /api/v1/order-requests/{requestId}` 只能查询当前用户自己的 `QUEUED/PROCESSING/ORDERED/REJECTED/FAILED`，`ORDERED` 返回 `orderNo`；MySQL `RESERVED/UNKNOWN` 对外统一映射为 `PROCESSING`。
 - Kafka Topic：`tokenx.seckill-order-commands.v1`；消息 key 为 `activityId`，保证同一活动进入同一分区、不同活动可并行。
+- F9 默认命令 Topic 为 8 个分区、Consumer 并发 8（可配置但并发不能超过分区数）；支付事件 Topic 使用独立分区和并发设置。消息 key 固定活动 ID，因此单活动有序，不同活动可并行。
 - 消息最小字段：`schemaVersion`、`requestId`、`activityId`、`userId`、`admittedAt`。价格、额度、权限等最终值仍从服务端事实源取得，不信任消息中的客户端业务值。
 
 #### Kafka 可靠性边界
@@ -127,7 +128,9 @@ F9 必须新增 `seckill_request`，保存最终受理结果而不是替代订�
 
 - `(user_id, request_id)` 唯一；`(activity_id, user_id, status)` 只建普通查询索引，最终一人一单仍由 `purchase_order` 的唯一键兜底；
 - `ORDERED` 关联内部 `order_id`；`REJECTED/FAILED` 保存稳定错误码；
-- API 到 Kafka 期间的 `RESERVED/QUEUED` 快状态在 Redis，Consumer 处理后把终态落 MySQL并回写 Redis；
+- MySQL 先持久化 `RESERVED` 意图，只有 Broker ACK 后改为 `QUEUED` 并返回 `202`；Redis 同时保存 Lua 准入状态，Consumer 处理后把终态落 MySQL并回写 Redis；
+- 应用重启后后台任务会重发超过 30 秒的 `RESERVED` 请求；ACK 后但 MySQL 状态更新失败时也可能重复发布，Worker 以 requestId 吸收重复命令；
+- Worker 在事务外先提交 `PROCESSING`，随后订单、条件扣库存和终态在同一事务提交，Kafka offset 在事务成功后提交；
 - Redis 丢失时不返回伪造的“失败”。查询端在终态尚未落库时返回 `PROCESSING`，运维先暂停该活动准入并恢复状态。
 - Consumer 先按 `(user_id,request_id)` 识别重复，再在同一 MySQL 事务写库存、订单与请求终态；重复投递返回既有终态，不再次扣库存。业务拒绝时按拒绝原因幂等修正 Redis 用户标记和 gate quota。
 
@@ -190,11 +193,12 @@ tokenx:seckill:{activityId}:requests
 | Consumer 连续处理失败 / DLT 不可用 | 事件保留在当前 offset，或最终进入 DLT | 有限重试；DLT 发送失败不提交 offset，并保留错误可见性 |
 | Redis 在准入前不可用 | 阶段 B 可限量回退；阶段 C 异步接口返回 `503` | MySQL 仍正确；不静默改变 API 契约，并发闸门保护 DB |
 | Lua 已预留，Kafka 明确发送失败 | `503` | 比对 `requestId` 后补偿 Redis；补偿可重试 |
-| Lua 已预留，Kafka 结果不确定或进程崩溃 | 客户端未获得成功承诺 | 标记 `UNKNOWN`，由租约与 Kafka/MySQL 终态对账后再补偿；不能在结果不确定时立即释放额度 |
+| Lua 已预留，Kafka 结果不确定 | 客户端未获得成功承诺 | 标记 `UNKNOWN` 并暂停该活动；恢复任务会用相同 requestId 重发，仍不能收敛时人工核对 Kafka 记录/offset，不能提前释放额度 |
+| 请求落库后进程在 Broker ACK 前崩溃 | 客户端未收到 `202` | 后台任务重发超过 30 秒的 `RESERVED` 意图；允许重复命令并由 Worker 幂等收敛 |
 | Kafka 已 ACK，HTTP 响应丢失 | 客户端重试得到同一请求状态 | 同一用户同一 `requestId` 幂等；可能重复消息但不重复业务效果 |
 | Consumer 在 DB 提交前崩溃 | 仍为 `QUEUED` | 消息重投，事务重新执行 |
 | Consumer 在 DB 提交后、offset 提交前崩溃 | 仍可查到终态 | 消息重投，唯一键/状态条件返回既有结果后提交 offset |
-| Redis 全量丢失 | 暂停活动新准入 | MySQL/Kafka 事实不丢；重建 gate 后恢复，不直接以总库存初始化 |
+| Redis 全量丢失或 gate/users/requests 任一 key 缺失 | Lua 原子写入 `REBUILDING` 并 fail-closed | 按 MySQL 可用库存减去持久化未完成请求重建 users/requests/quota；恢复未收敛的 `UNKNOWN` 时需先核查 broker offset，不能盲目开放 |
 | Kafka 不可用 | 不返回 `202` | Redis 预留被补偿；同步链路是否开放由受控降级开关决定，默认保护 DB |
 | MySQL 不可用 | 已 ACK 请求继续积压 | Consumer 不提交 offset；恢复后重放，积压超过阈值时入口停止准入 |
 

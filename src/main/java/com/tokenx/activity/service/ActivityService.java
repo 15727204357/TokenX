@@ -14,12 +14,18 @@ import com.tokenx.activity.model.SeckillActivity;
 import com.tokenx.catalog.dto.PackageSnapshot;
 import com.tokenx.catalog.service.CatalogService;
 import com.tokenx.infrastructure.error.BusinessException;
+import com.tokenx.order.config.SeckillProperties;
+import com.tokenx.order.service.SeckillAdmissionGate;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * Activity configuration and public reading.
@@ -43,6 +49,7 @@ import org.springframework.transaction.annotation.Transactional;
  */
 @Service
 public class ActivityService {
+  private static final Logger log = LoggerFactory.getLogger(ActivityService.class);
 
   static final String ACTIVITY_NOT_FOUND = "ACTIVITY_NOT_FOUND";
   static final String ACTIVITY_STATE_CONFLICT = "ACTIVITY_STATE_CONFLICT";
@@ -64,18 +71,24 @@ public class ActivityService {
   private final CatalogService catalogService;
   private final Clock clock;
   private final ActivityReadCache activityReadCache;
+  private final SeckillAdmissionGate admissionGate;
+  private final SeckillProperties seckillProperties;
 
   public ActivityService(
       SeckillActivityMapper activityMapper,
       ActivityInventoryMapper inventoryMapper,
       CatalogService catalogService,
       Clock clock,
-      ActivityReadCache activityReadCache) {
+      ActivityReadCache activityReadCache,
+      SeckillAdmissionGate admissionGate,
+      SeckillProperties seckillProperties) {
     this.activityMapper = activityMapper;
     this.inventoryMapper = inventoryMapper;
     this.catalogService = catalogService;
     this.clock = clock;
     this.activityReadCache = activityReadCache;
+    this.admissionGate = admissionGate;
+    this.seckillProperties = seckillProperties;
   }
 
   /**
@@ -163,6 +176,26 @@ public class ActivityService {
     }
     activity.setStatus(target);
     activityReadCache.invalidateAfterCommit(id);
+    if (target == ActivityStatus.PUBLISHED && seckillProperties.getMode() == SeckillProperties.Mode.ASYNC) {
+      int stock = inventoryMapper.selectById(id).getAvailableStock();
+      long endRetention = Math.max(0L, java.time.Duration.between(now, activity.getEndInstant()).toSeconds()) + java.time.Duration.ofHours(24).toSeconds();
+      long ttlSeconds = Math.max(seckillProperties.getAdmissionTtl().toSeconds(), endRetention);
+      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+        @Override public void afterCommit() {
+          try { admissionGate.initialize(id, stock, ttlSeconds); }
+          catch (RuntimeException ex) { log.error("seckill admission gate initialization failed activityId={} type={}", id, ex.getClass().getSimpleName()); }
+        }
+      });
+    } else {
+      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+        @Override public void afterCommit() {
+          if (seckillProperties.getMode() == SeckillProperties.Mode.ASYNC) {
+            try { admissionGate.markRebuilding(id); }
+            catch (RuntimeException ex) { log.error("seckill admission gate pause failed activityId={} type={}", id, ex.getClass().getSimpleName()); }
+          }
+        }
+      });
+    }
     return response(activity, now);
   }
 
@@ -212,7 +245,7 @@ public class ActivityService {
    * @param now current instant from the injected clock, truncated to milliseconds
    * @throws BusinessException {@code 404 ACTIVITY_NOT_FOUND}, {@code 409 ACTIVITY_NOT_ACTIVE}
    */
-  @Transactional
+  @Transactional(readOnly = true, noRollbackFor = BusinessException.class)
   public ActivityOrderSnapshot requireOrderable(long id, Instant now) {
     SeckillActivity activity = activityMapper.selectForShare(id);
     if (activity == null) {

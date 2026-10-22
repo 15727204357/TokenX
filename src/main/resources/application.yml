@@ -129,6 +129,16 @@ tokenx:
     send-timeout: ${TOKENX_KAFKA_SEND_TIMEOUT:3s}
     listener-retry-delay: ${TOKENX_KAFKA_LISTENER_RETRY_DELAY:250ms}
     listener-retry-count: ${TOKENX_KAFKA_LISTENER_RETRY_COUNT:3}
+    seckill-orders-topic: ${TOKENX_SECKILL_ORDERS_TOPIC:tokenx.seckill-order-commands.v1}
+    seckill-orders-dlt-topic: ${TOKENX_SECKILL_ORDERS_DLT_TOPIC:tokenx.seckill-order-commands.dlt.v1}
+    seckill-consumer-group-id: ${TOKENX_SECKILL_CONSUMER_GROUP:tokenx-seckill-orders-v1}
+    seckill-topic-partitions: ${TOKENX_SECKILL_ORDER_PARTITIONS:8}
+    seckill-listener-concurrency: ${TOKENX_SECKILL_ORDER_CONCURRENCY:8}
+    seckill-listener-enabled: ${TOKENX_SECKILL_LISTENER_ENABLED:true}
+  seckill:
+    mode: ${TOKENX_SECKILL_MODE:SYNC}
+    admission-ttl: ${TOKENX_SECKILL_ADMISSION_TTL:48h}
+    recovery-interval: ${TOKENX_SECKILL_RECOVERY_INTERVAL:5s}
 
 server:
   port: 8080

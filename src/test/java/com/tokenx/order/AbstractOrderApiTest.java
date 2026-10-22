@@ -18,6 +18,7 @@ import com.tokenx.catalog.mapper.TokenPackageMapper;
 import com.tokenx.catalog.model.PackageStatus;
 import com.tokenx.catalog.model.TokenPackage;
 import com.tokenx.order.mapper.PurchaseOrderMapper;
+import com.tokenx.order.mapper.SeckillRequestMapper;
 import com.tokenx.order.model.PurchaseOrder;
 import com.tokenx.order.timeout.OrderTimeoutService;
 import com.tokenx.wallet.mapper.TokenLedgerMapper;
@@ -85,6 +86,7 @@ public abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
   @Autowired protected SeckillActivityMapper activityMapper;
   @Autowired protected ActivityInventoryMapper inventoryMapper;
   @Autowired protected PurchaseOrderMapper orderMapper;
+  @Autowired protected SeckillRequestMapper seckillRequestMapper;
   @Autowired protected TokenLedgerMapper ledgerMapper;
   @Autowired protected OrderTimeoutService timeoutService;
   @Autowired protected PasswordEncoder passwordEncoder;
@@ -110,6 +112,9 @@ public abstract class AbstractOrderApiTest extends AbstractIntegrationTest {
     }
 
     for (Long activityId : activityIds) {
+      seckillRequestMapper.delete(
+          Wrappers.<com.tokenx.order.model.SeckillRequestRow>lambdaQuery()
+              .eq(com.tokenx.order.model.SeckillRequestRow::getActivityId, activityId));
       orderMapper.delete(
           Wrappers.<PurchaseOrder>lambdaQuery().eq(PurchaseOrder::getActivityId, activityId));
       inventoryMapper.deleteById(activityId);

@@ -47,8 +47,8 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
         .noneMatch(info -> info.getState().isFailed());
 
     assertThat(flyway.info().current().getVersion().getVersion())
-        .as("F8 is the last migration: the schema ends at V11")
-        .isEqualTo("11");
+        .as("F9 request tracking migrations end at V14")
+        .isEqualTo("14");
   }
 
   @Test
@@ -73,6 +73,7 @@ class FlywayMigrationTest extends AbstractIntegrationTest {
             "token_ledger",
             "outbox_event",
             "processed_message")
+        .contains("seckill_request")
         .doesNotContain("schema_probe");
   }
 

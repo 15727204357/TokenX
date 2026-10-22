@@ -51,6 +51,13 @@
 - Broker 为 4.3.1，客户端 4.2.1：`PROJECT_SPEC.md` §2 明确“不要求客户端同 Broker 小版本”，故不手工对齐，也不手写 Kafka 版本号。
 - F8 已在隔离的单节点 Broker 上验证 API 协商、发布、消费和 DLT；测试不清理或重置 Topic。
 
+## F9 Redis + Kafka 命令链路
+
+- F9 未增加 Maven 依赖：复用 Boot BOM 管理的 Spring Kafka `4.1.1` / Kafka Client `4.2.1`，以及 Spring Data Redis `4.1.1` / Lettuce `7.5.2.RELEASE`。
+- 秒杀命令和支付事件使用不同 Topic、Consumer group、分区/并发设置；秒杀默认 8 分区、8 并发，仍受部署 Broker 容量约束。
+- F9 完整门禁实测 283 项测试通过；新增 13 项 F9 业务/集成测试。真实 Kafka 集成链路使用本机 `127.0.0.1:9092`，每次测试运行使用唯一 `tokenx.test.f9.<runId>.*` Topic 和 Consumer Group；不删除 Topic、不清空 Redis、不重置数据。
+- 本次执行时默认测试 Broker `127.0.0.1:19092` 不可用，因此通过 `TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092` 指向本机已运行 Broker。F9 验证的是单 Broker 功能链路，不代表 Kafka 高可用或性能结论。
+
 ## 前端依赖（F1 引入，`frontend/pnpm-lock.yaml` 固定）
 
 | 组件 | 版本 | 说明 |

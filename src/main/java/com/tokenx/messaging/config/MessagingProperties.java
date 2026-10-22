@@ -16,11 +16,17 @@ public class MessagingProperties {
   private String orderEventsTopic = "tokenx.order-events.v1";
   private String orderEventsDltTopic = "tokenx.order-events.dlt.v1";
   private String consumerGroupId = "tokenx-order-events-v1";
+  private String seckillOrdersTopic = "tokenx.seckill-order-commands.v1";
+  private String seckillOrdersDltTopic = "tokenx.seckill-order-commands.dlt.v1";
+  private String seckillConsumerGroupId = "tokenx-seckill-orders-v1";
+  private boolean seckillListenerEnabled=true;
   private boolean kafkaEnabled = true;
   private boolean outboxEnabled = true;
   @Min(1) @Max(1000) private int topicPartitions = 1;
   @Min(1) @Max(10) private int topicReplicationFactor = 1;
   @Min(1) @Max(10) private int listenerConcurrency = 1;
+  @Min(1) @Max(1000) private int seckillTopicPartitions = 8;
+  @Min(1) @Max(1000) private int seckillListenerConcurrency = 8;
   @Min(1) @Max(500) private int outboxBatchSize = 25;
   @Min(1) @Max(10) private int outboxMaxAttempts = 5;
   @NotNull private Duration outboxPollInterval = Duration.ofSeconds(1);
@@ -50,6 +56,15 @@ public class MessagingProperties {
   public String getConsumerGroupId() {
     return consumerGroupId;
   }
+
+  public String getSeckillOrdersTopic(){return seckillOrdersTopic;}
+  public void setSeckillOrdersTopic(String v){seckillOrdersTopic=v;}
+  public String getSeckillOrdersDltTopic(){return seckillOrdersDltTopic;}
+  public void setSeckillOrdersDltTopic(String v){seckillOrdersDltTopic=v;}
+  public String getSeckillConsumerGroupId(){return seckillConsumerGroupId;}
+  public void setSeckillConsumerGroupId(String v){seckillConsumerGroupId=v;}
+  public boolean isSeckillListenerEnabled(){return seckillListenerEnabled;}
+  public void setSeckillListenerEnabled(boolean v){seckillListenerEnabled=v;}
 
   public void setConsumerGroupId(String value) {
     consumerGroupId = value;
@@ -94,6 +109,11 @@ public class MessagingProperties {
   public void setListenerConcurrency(int value) {
     listenerConcurrency = value;
   }
+
+  public int getSeckillTopicPartitions(){return seckillTopicPartitions;}
+  public void setSeckillTopicPartitions(int value){seckillTopicPartitions=value;}
+  public int getSeckillListenerConcurrency(){return seckillListenerConcurrency;}
+  public void setSeckillListenerConcurrency(int value){seckillListenerConcurrency=value;}
 
   public int getOutboxBatchSize() {
     return outboxBatchSize;
@@ -175,9 +195,14 @@ public class MessagingProperties {
         || orderEventsDltTopic.isBlank()
         || orderEventsTopic.equals(orderEventsDltTopic)
         || consumerGroupId == null
-        || consumerGroupId.isBlank()) {
+        || consumerGroupId.isBlank()
+        || seckillOrdersTopic == null || seckillOrdersTopic.isBlank()
+        || seckillOrdersDltTopic == null || seckillOrdersDltTopic.isBlank()
+        || seckillOrdersTopic.equals(seckillOrdersDltTopic)
+        || seckillConsumerGroupId == null || seckillConsumerGroupId.isBlank()) {
       throw new IllegalStateException("tokenx.messaging topic and consumer group names are required");
     }
+    if(seckillListenerConcurrency>seckillTopicPartitions)throw new IllegalStateException("tokenx.messaging.seckill-listener-concurrency must not exceed seckill-topic-partitions");
     requireDuration(outboxPollInterval, Duration.ofMillis(10), Duration.ofMinutes(1), "poll interval");
     requireDuration(outboxLease, Duration.ofSeconds(1), Duration.ofMinutes(5), "outbox lease");
     requireDuration(retryBaseDelay, Duration.ofMillis(1), Duration.ofMinutes(5), "retry base delay");

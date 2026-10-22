@@ -263,11 +263,15 @@
 
 **验收**：断开 Kafka / 消费者重启后，事件不丢失且不会造成重复业务效果；消费者错误有可见重试/积压状态；不影响支付入账的本地事务。
 
-### [ ] F9 Redis Lua 准入与 Kafka 异步下单
+### [x] F9 Redis Lua 准入与 Kafka 异步下单
 
 **范围**：按 `HIGH_CONCURRENCY_DESIGN.md` 实施已决方案：Redis Lua 原子准入与可重复补偿；Kafka `tokenx.seckill-order-commands.v1` 是唯一订单队列；`seckill_request` 保存最终结果；Worker 以至少一次语义落 MySQL。保留 F4 同步实现作基线，通过 `tokenx.seckill.mode` 与异步入口互斥开放，不做故障时静默切换，不引入 Redis Stream。
 
 **验收**：仅在 Broker ACK 后返回 202；同一活动同分区有序、不同活动可并行；重复消息不重复建单；Kafka/MySQL/Worker 故障恢复后可收敛；Redis 重启时活动先暂停并重建，不按总库存盲目开放；功能与并发正确性不退化；区分“请求受理”和“订单创建成功”。
+
+> 完成记录（2026-10-22，分支 `feature/F9-redis-kafka-seckill`）：`tokenx.seckill.mode=SYNC|ASYNC` 互斥开关；新增 `POST /api/v1/activities/{id}/order-requests`（仅 Broker ACK 后返回 202）、用户级状态查询和管理员 gate 重建接口。V12–V14 新增 `seckill_request` 及 UNKNOWN/RESERVED 状态；Redis Lua 原子预留、幂等、补偿和缺 key fail-closed；Worker 通过 MySQL 条件库存更新、请求/订单唯一键和事务提交后 Kafka offset 实现至少一次幂等落单。超过 30 秒的 RESERVED/UNKNOWN 请求由恢复任务重发；MySQL 短时故障时 Worker 保持 offset 不前移；剩余 UNKNOWN 会阻止 gate 重开并要求人工核对 Broker offset。
+> F9 新增 13 项业务/集成测试，覆盖真实 MySQL、Redis、Kafka 正常链路，Lua 并发额度与补偿，ACK/503 边界，Kafka 重放、分区顺序、不同活动并行、Worker 重启/暂时 MySQL 故障、Redis key 丢失和正确重建，以及受理/终态查询。完整 `./mvnw clean verify`：283 项测试通过，0 失败、0 错误、0 跳过。F9 集成测试使用本机 Broker `127.0.0.1:9092` 的每次运行唯一 Topic 和 Consumer Group；未清理 Topic、未清空 Redis 或重置数据。
+> 前端未修改，仍执行了 `pnpm lint`、`pnpm test`（7 文件、58 测试）、`pnpm build`、`pnpm format:check`，全部通过；`git diff --check` 通过。没有执行压测或报告性能数据，留给 F10。
 
 ### [ ] F10 监控、压测与故障注入
 
@@ -291,4 +295,4 @@
 
 ## 初次交给 Qoder 的简短指令（历史归档）
 
-> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5、F6、F7、F8 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F9。
+> F0-1～F0-3、F1、F2、F3、F4、F4.5、F5、F6、F7、F8、F9 已完成，不得再次执行这段初始提示。后续代理从本文件第一个未完成任务开始，当前为 F10。

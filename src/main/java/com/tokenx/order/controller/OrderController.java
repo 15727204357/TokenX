@@ -9,6 +9,7 @@ import com.tokenx.order.service.CreatedOrder;
 import com.tokenx.order.service.NormalOrderService;
 import com.tokenx.order.service.OrderQueryService;
 import com.tokenx.order.service.SeckillOrderService;
+import com.tokenx.order.config.SeckillProperties;
 import com.tokenx.order.support.IdempotencyKeys;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
@@ -56,14 +57,17 @@ public class OrderController {
   private final SeckillOrderService seckillOrderService;
   private final NormalOrderService normalOrderService;
   private final OrderQueryService orderQueryService;
+  private final SeckillProperties seckillProperties;
 
   public OrderController(
       SeckillOrderService seckillOrderService,
       NormalOrderService normalOrderService,
-      OrderQueryService orderQueryService) {
+      OrderQueryService orderQueryService,
+      SeckillProperties seckillProperties) {
     this.seckillOrderService = seckillOrderService;
     this.normalOrderService = normalOrderService;
     this.orderQueryService = orderQueryService;
+    this.seckillProperties = seckillProperties;
   }
 
   /**
@@ -79,6 +83,9 @@ public class OrderController {
       @PathVariable @Positive(message = "activityId must be positive") long activityId,
       @RequestHeader(name = IdempotencyKeys.HEADER, required = false) String idempotencyKey,
       @AuthenticationPrincipal Jwt jwt) {
+    if (seckillProperties.getMode() != SeckillProperties.Mode.SYNC) {
+      throw new com.tokenx.infrastructure.error.BusinessException(HttpStatus.NOT_FOUND, "NOT_FOUND", "resource not found");
+    }
     CurrentUser user = CurrentUser.from(jwt);
     UUID requestKey = IdempotencyKeys.parse(idempotencyKey);
 

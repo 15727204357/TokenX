@@ -25,6 +25,7 @@
 - 后续 Redis Lua 抢购准入仍以 Redis 为快路径、MySQL 为最终库存与资格权威。
 - Kafka 作为唯一异步下单队列；Transactional Outbox 只用于数据库事务后的下游事件。**不使用 Redis Stream 作为第二条订单队列。**
 - F8 已为支付成功建立 `ORDER_PAID` v1 事件：支付事务写 `outbox_event`，Publisher 提交领取事务后发布到 `tokenx.order-events.v1`（Key=`orderNo`），消费者在独立 MySQL 事务写入唯一 `(consumer_name,event_id)` receipt 后再提交 Kafka offset；重复投递按至少一次语义幂等处理。
+- F9 异步秒杀使用独立 `POST /api/v1/activities/{id}/order-requests` 受理接口和 `GET /api/v1/order-requests/{requestId}` 状态查询；请求必须带规范 UUID `Idempotency-Key`，仅在 Broker ACK 后返回 `202 QUEUED`。Redis Lua 只做活动准入，Kafka `tokenx.seckill-order-commands.v1` 是唯一命令队列，MySQL Worker 最终创建订单。`tokenx.seckill.mode=SYNC|ASYNC` 互斥开放秒杀写入口；准入阶段 Redis/Kafka 故障返回 `503`，不静默回退同步通道；已 ACK 而 Worker/MySQL 暂时不可用时查询保持 `PROCESSING`。`seckill_request` 保存请求状态，不替代库存/订单事实表。
 - 简单限流、指标采集、压测和同步/异步方案对比。
 - Redis Stream 只作为黑马点评参考实现的研究对象，不进入 TokenX 订单链路。
 
@@ -174,8 +175,8 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | POST | `/orders/{orderNo}/mock-pay` | 模拟支付（需登录，**无请求体**）。首次成功与已支付重放都返回 `200` 与更新后的订单 | `400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 ORDER_NOT_FOUND`、`409 ORDER_STATE_CONFLICT` | F5 |
 | GET | `/wallet` | 查询**自己的**余额（需登录） | `200` `{"availableBalance","updatedAt"}`；`401 UNAUTHORIZED` | F5 |
 | GET | `/wallet/ledger` | 查询**自己的**流水分页（需登录；`cursor` + `limit`，默认 20、上限 100） | `200` `{"items","nextCursor","hasMore"}`；`400 VALIDATION_FAILED`、`401 UNAUTHORIZED` | F5 |
-| POST | `/activities/{id}/order-requests` | V1.5 异步秒杀受理，成功返回 202 | F9 |
-| GET | `/order-requests/{requestId}` | 查询异步请求最终结果 | F9 |
+| POST | `/activities/{id}/order-requests` | V1.5 异步秒杀受理；只在 Kafka ACK 后返回 `202 {requestId,status:"QUEUED"}` | F9，ASYNC 模式 |
+| GET | `/order-requests/{requestId}` | 查询自己的请求；`QUEUED/PROCESSING/ORDERED/REJECTED/FAILED`，仅 `ORDERED` 有 `orderNo` | F9 |
 
 认证：`Authorization: Bearer <JWT>`；用户身份从认证上下文取，不允许从请求体传 `userId` 来决定交易归属。活动时间、库存、价格等由服务端决定。
 
@@ -268,19 +269,19 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
   并暴露错误，而不是伪装成“本轮无到期订单”。
 - **零 DDL**：不新增迁移，复用 `V8` 的 `idx_order_timeout(status, expires_at)`，schema 仍为 `V9`。
 
-## 8. 运行时拓扑（V1）
+## 8. 运行时拓扑（V1 同步基线）
 
 ```text
 React (Vite dev server :5173)
     └── HTTP /api → Spring Boot (:8080)
                           ├── MySQL (:3306) 交易真相源
                           └── Redis (:6379) V1 只在必要时使用
-Kafka (:9092) 本地已安装，但在 V1.5 前不参与核心链路
+Kafka (:9092) 在 F9 ASYNC 模式承载异步秒杀命令；F8 支付事件继续使用独立 Outbox 链路
 ```
 
 开发环境约束：本机 MySQL root 有密码（业务应用应使用本地专用账号）；Redis 当前无密码，只能监听回环地址；Kafka 开发默认本机连接。密码只来自用户本地环境变量或未提交的 `application-local.yml`，绝不放到 Git。
 
-## 9. 运行时拓扑（V1.5 已决目标，按计划分阶段实现）
+## 9. 运行时拓扑（V1.5，F9 已实现）
 
 ```text
 Client → API → Redis Lua 原子准入 → Kafka command topic → Order Worker

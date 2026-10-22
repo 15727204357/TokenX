@@ -37,7 +37,7 @@ import tools.jackson.databind.ObjectMapper;
 /** Real Kafka 4.3.x + MySQL integration for Outbox retry, consumer restart and idempotency. */
 @SpringBootTest(
     properties = {
-      "spring.kafka.bootstrap-servers=127.0.0.1:19092",
+      "spring.kafka.bootstrap-servers=${TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:19092}",
       "spring.kafka.listener.auto-startup=true",
       "tokenx.messaging.kafka-enabled=true",
       "tokenx.messaging.listener-enabled=true",
@@ -54,7 +54,7 @@ import tools.jackson.databind.ObjectMapper;
 class OrderEventKafkaIntegrationTest extends AbstractOrderApiTest {
 
   private static final String CONSUMER_NAME = "order-paid-receipt-v1";
-  private static final String BROKER = "127.0.0.1:19092";
+  private static final String BROKER = System.getenv().getOrDefault("TOKENX_TEST_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:19092");
 
   @Autowired private JdbcTemplate jdbc;
   @Autowired private KafkaTemplate<Object, Object> kafkaTemplate;
