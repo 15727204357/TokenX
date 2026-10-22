@@ -234,11 +234,23 @@
 
 ## Phase 3：仅在 V1 完成后优化秒杀
 
-### [ ] F7 热读缓存与同步链路保护
+### [x] F7 热读缓存与同步链路保护
 
-**范围**：选择实测高频的套餐或活动读取路径，实施 Cache-Aside + TTL 抖动 + 主动失效；增加有界并发、超时与 429/503 过载语义，为后续 Redis 准入失败时保护同步 MySQL 链路。
-
-**验收**：缓存命中、穿透与更新一致性测试通过；Redis 故障只能限量回退 MySQL，不能无保护 fail-open；优化前后压测口径相同。
+> 完成记录（2026-10-22，分支 `feature/F7-hot-read-protection`）：
+> 唯一缓存入口为 `GET /api/v1/activities/{id}`；新增 `activity/cache/`，Redis Cache-Aside 缓存公开活动快照，
+> 不缓存 `runtimeStatus`，每次由注入的 `Clock` 重新计算。公开活动正缓存 TTL 随机 30–45 秒；不存在、草稿、下架
+> 同为 `404 ACTIVITY_NOT_FOUND` 并负缓存 5–10 秒。键空间 `tokenx:activity:public:v1`，使用活动 generation
+> 键避免并发旧查询在事务提交失效后恢复旧值。
+> 活动创建、状态变更、秒杀库存预占和 F6 超时库存归还均在各自数据库事务提交后失效缓存；Redis 失效故障不会
+> 影响数据库提交。展示库存仍为快照，订单仍只由 MySQL 条件更新及唯一键裁决。
+> `tokenx.activity-cache.*` 在启动时验证；Redis 连接/命令超时默认 500ms（最大 5s），总入口默认 128 并发 + 64 个有界等待名额/最多
+> 等待 10ms（耗尽 `429 ACTIVITY_READ_CAPACITY_EXCEEDED`），Redis 故障回源最多 8 并发 + 8 个有界等待名额/最多等待 20ms（耗尽
+> `503 ACTIVITY_READ_UNAVAILABLE`）。没有缓存后台接口、下单校验、Lua 准入、Kafka 或 DDL。
+> `./mvnw clean verify` **265 个测试通过**（真实 MySQL 9.7 `tokenx_test` + 真实 Redis 8.10；F7 新增 10 个测试：
+> 正/负缓存、命中避免 MySQL 回源、TTL 抖动范围、跨时间边界运行态、发布/下架/预占/归还失效、旧查询并发回填、
+> Redis 故障安全回源、回源闸门 503、总入口过载 429、Redis 恢复重新用缓存；原下单/支付/关单及并发测试全部通过）。
+> 前端 `pnpm lint`、`pnpm test`（7 文件、58 测试）、`pnpm build`、`pnpm format:check` 全部通过；前端无需修改。
+> 没有进行正式压测或报告 QPS，F10 使用相同数据集、并发、到达率、时长、机器/JVM/连接池记录对照结果。
 
 ### [ ] F8 事件模型与 Kafka Outbox
 

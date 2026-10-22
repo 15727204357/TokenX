@@ -1,6 +1,7 @@
 package com.tokenx.order.timeout;
 
 import com.tokenx.activity.mapper.ActivityInventoryMapper;
+import com.tokenx.activity.service.ActivityService;
 import com.tokenx.order.mapper.PurchaseOrderMapper;
 import com.tokenx.order.model.OrderType;
 import com.tokenx.order.model.PurchaseOrder;
@@ -56,16 +57,19 @@ public class OrderTimeoutService {
   private final PurchaseOrderMapper orderMapper;
   private final ActivityInventoryMapper inventoryMapper;
   private final Clock clock;
+  private final ActivityService activityService;
   private final TransactionTemplate writeTemplate;
 
   public OrderTimeoutService(
       PurchaseOrderMapper orderMapper,
       ActivityInventoryMapper inventoryMapper,
+      ActivityService activityService,
       Clock clock,
       PlatformTransactionManager transactionManager) {
     this.orderMapper = orderMapper;
     this.inventoryMapper = inventoryMapper;
     this.clock = clock;
+    this.activityService = activityService;
     // Explicit boundary for the same reason as payment: the transaction body is what a reviewer has
     // to be able to read as one list of statements, and each call here must be exactly one of them.
     this.writeTemplate = new TransactionTemplate(transactionManager);
@@ -155,7 +159,11 @@ public class OrderTimeoutService {
    * @return the order that was closed, or {@code null} when nothing expired is left
    */
   private PurchaseOrder closeOne(LocalDateTime afterExpiresAt, Long afterId) {
-    return writeTemplate.execute(status -> closeInTransaction(afterExpiresAt, afterId));
+    PurchaseOrder closed = writeTemplate.execute(status -> closeInTransaction(afterExpiresAt, afterId));
+    if (closed != null && closed.getOrderType() == OrderType.SECKILL) {
+      activityService.invalidatePublicCacheAfterCommit(closed.getActivityId());
+    }
+    return closed;
   }
 
   private PurchaseOrder closeInTransaction(LocalDateTime afterExpiresAt, Long afterId) {

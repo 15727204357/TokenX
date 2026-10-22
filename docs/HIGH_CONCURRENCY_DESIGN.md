@@ -46,6 +46,14 @@
 
 ## 3. 分阶段架构
 
+### 3.0 F7：活动详情 Cache-Aside 与读路径背压
+
+F7 唯一热点是 `GET /api/v1/activities/{id}`。Redis 命名空间为 `tokenx:activity:public:v1`：活动快照按当前 generation 存放，正缓存 TTL 随机 30–45 秒，负缓存（不存在/草稿/下架同一 404）随机 5–10 秒。缓存只保留公开配置与库存展示快照；`runtimeStatus` 每次用服务端 `Clock` 计算，缓存命中也会跨 `startAt/endAt` 正确变化。
+
+每次活动创建、发布、下架、秒杀预占和超时归还只在 MySQL 成功提交后递增该活动 generation。查询先读取 generation，数据库回源后只写入该 generation 的 key；因此旧回源晚于失效时仍只会写入已过期的代际，后续请求不会重新读到旧值。Redis 失效失败不会影响已提交事务，TTL 提供最终收敛上界。
+
+保护参数全有界且启动时校验：Lettuce 连接/命令超时默认 500ms；总入口最多 128 个并发、64 个等待名额，等待最多 10ms，耗尽返回 `429 ACTIVITY_READ_CAPACITY_EXCEEDED`；Redis 故障时 MySQL fallback 最多 8 个并发、8 个等待名额、最多等待 20ms，超限返回 `503 ACTIVITY_READ_UNAVAILABLE`。Redis 恢复后正常重新使用/填充缓存。没有缓存后台路径或下单资格检查，MySQL 条件扣库存与唯一键仍是交易裁判。该缓存不执行 Lua 秒杀准入。
+
 ### 3.1 阶段 A：MySQL 同步强一致基线（V1）
 
 ```text
@@ -169,6 +177,7 @@ tokenx:seckill:{activityId}:requests
 
 | 故障点 | 对外结果 | 恢复与正确性 |
 |---|---|---|
+| Redis 在活动详情缓存读取时不可用 | 最多 8 个并发、等待最多 20ms 回退 MySQL；名额耗尽 `503 ACTIVITY_READ_UNAVAILABLE` | 总入口另有并发上限，过载 `429 ACTIVITY_READ_CAPACITY_EXCEEDED`；恢复后重用缓存 |
 | Redis 在准入前不可用 | 阶段 B 可限量回退；阶段 C 异步接口返回 `503` | MySQL 仍正确；不静默改变 API 契约，并发闸门保护 DB |
 | Lua 已预留，Kafka 明确发送失败 | `503` | 比对 `requestId` 后补偿 Redis；补偿可重试 |
 | Lua 已预留，Kafka 结果不确定或进程崩溃 | 客户端未获得成功承诺 | 标记 `UNKNOWN`，由租约与 Kafka/MySQL 终态对账后再补偿；不能在结果不确定时立即释放额度 |
@@ -193,11 +202,12 @@ tokenx:seckill:{activityId}:requests
 
 ## 7. 压测与故障注入顺序
 
-1. 阶段 A：低库存争抢、高有效写入、多活动并行、支付/关单竞争。
-2. 阶段 B：相同数据集复测，比较 DB 请求下降和入口 QPS；注入 Redis 超时与 key 丢失。
-3. 阶段 C：分别测受理和成单；停止/重启 Consumer、制造重复消息、断开 Kafka/MySQL、恢复积压。
-4. 每轮结束运行 `docs/DATABASE_DESIGN.md` §6 的对账 SQL；有一条差异即本轮失败。
-5. 只有瓶颈证据指向单库存行锁且 Redis/Kafka 已正确工作，才评审库存分桶；只有单机资源确实耗尽才评审分库分表。
+1. F7：固定相同数据集、并发数、到达率、时长、机器/JVM/连接池，记录活动详情入口请求、缓存命中/回源、状态码、延迟与 DB 查询数；不在 F7 宣称或记录 QPS 成绩，正式压测留给 F10。
+2. 阶段 A：低库存争抢、高有效写入、多活动并行、支付/关单竞争。
+3. 阶段 B：相同数据集复测，比较 DB 请求下降和入口 QPS；注入 Redis 超时与 key 丢失。
+4. 阶段 C：分别测受理和成单；停止/重启 Consumer、制造重复消息、断开 Kafka/MySQL、恢复积压。
+5. 每轮结束运行 `docs/DATABASE_DESIGN.md` §6.5 的对账 SQL；有一条差异即本轮失败。
+6. 只有瓶颈证据指向单库存行锁且 Redis/Kafka 已正确工作，才评审库存分桶；只有单机资源确实耗尽才评审分库分表。
 
 ## 8. 设计依据
 

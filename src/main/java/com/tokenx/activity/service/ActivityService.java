@@ -1,5 +1,6 @@
 package com.tokenx.activity.service;
 
+import com.tokenx.activity.cache.ActivityReadCache;
 import com.tokenx.activity.dto.ActivityAdminResponse;
 import com.tokenx.activity.dto.ActivityOrderSnapshot;
 import com.tokenx.activity.dto.ActivityPublicResponse;
@@ -62,16 +63,19 @@ public class ActivityService {
   private final ActivityInventoryMapper inventoryMapper;
   private final CatalogService catalogService;
   private final Clock clock;
+  private final ActivityReadCache activityReadCache;
 
   public ActivityService(
       SeckillActivityMapper activityMapper,
       ActivityInventoryMapper inventoryMapper,
       CatalogService catalogService,
-      Clock clock) {
+      Clock clock,
+      ActivityReadCache activityReadCache) {
     this.activityMapper = activityMapper;
     this.inventoryMapper = inventoryMapper;
     this.catalogService = catalogService;
     this.clock = clock;
+    this.activityReadCache = activityReadCache;
   }
 
   /**
@@ -107,6 +111,7 @@ public class ActivityService {
     ActivityInventory inventory =
         ActivityInventory.initial(activity.getId(), request.totalStock().intValue());
     inventoryMapper.insert(inventory);
+    activityReadCache.invalidateAfterCommit(activity.getId());
 
     return ActivityAdminResponse.from(activity, inventory, now);
   }
@@ -137,6 +142,7 @@ public class ActivityService {
       throw activityNotFound();
     }
     if (activity.getStatus() == target) {
+      activityReadCache.invalidateAfterCommit(id);
       return response(activity, now);
     }
     if (!activity.getStatus().canTransitionTo(target)) {
@@ -156,6 +162,7 @@ public class ActivityService {
       activityMapper.updateStatus(id, target);
     }
     activity.setStatus(target);
+    activityReadCache.invalidateAfterCommit(id);
     return response(activity, now);
   }
 
@@ -167,11 +174,19 @@ public class ActivityService {
    * endpoint cannot be used to discover unpublished activities.
    */
   public ActivityPublicResponse findPublishedById(long id) {
-    PublishedActivityRow row = activityMapper.selectPublishedDetail(id);
+    PublishedActivityRow row =
+        activityReadCache.find(id, () -> activityMapper.selectPublishedDetail(id)).orElse(null);
     if (row == null) {
       throw activityNotFound();
     }
+    // Run-time status is intentionally evaluated on every request, never retained in Redis.
     return ActivityPublicResponse.from(row, now());
+  }
+
+  /** Called after a successful inventory/order transaction commits. */
+  public void invalidatePublicCacheAfterCommit(long id) {
+    // Order and timeout services call this only after their explicit transaction template returned.
+    activityReadCache.invalidateCommitted(id);
   }
 
   /**

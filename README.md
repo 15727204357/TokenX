@@ -2,7 +2,7 @@
 
 TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工程：管理员配置套餐与限时活动，用户在活动时间内抢购，订单支持模拟支付，支付成功后 Token 额度进入钱包并生成不可变流水。
 
-> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5`、`F6` 完成——最小可运行骨架、MySQL 迁移链路、
+> **当前状态**：`F0-1`～`F0-3`、`F1`、`F2`、`F3`、`F4`、`F4.5`、`F5`、`F6`、`F7` 完成——最小可运行骨架、MySQL 迁移链路、
 > Redis 连通性、数据库/高并发设计基线，注册、登录、JWT 鉴权、`/users/me`，Token 套餐目录
 > （管理员创建/上下架、游客游标分页列表与详情、公开列表页），秒杀活动配置与库存初始化
 > （管理员创建/发布/下架、游客活动详情页、服务端时间驱动的运行状态），**同步秒杀下单**
@@ -11,7 +11,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 > **模拟支付与钱包**（同一事务内订单转 `PAID` + 秒杀预占结转 + 余额入账 + 不可变流水，
 > 重复/并发支付只入账一次，余额与流水分页查询，订单页支付按钮与钱包页），以及**订单超时关闭**
 > （`FOR UPDATE SKIP LOCKED` 有界领取、每单一个短事务、秒杀预占归还可用库存、支付与关单只能有一个赢家）。
-> Redis/Kafka 优化在 F7 及以后。
+> F7 活动热读缓存与同步链路保护已完成：公开详情使用有界 Redis Cache-Aside 与事务提交后代际失效；交易正确性继续由 MySQL 保证。Kafka 与秒杀准入依后续阶段实施。
 > 交易过程中的“支付”是**本地模拟**，不接入任何真实资金渠道，不可用于生产支付场景。
 
 ## 技术栈
@@ -23,7 +23,7 @@ TokenX 是一个 **AI Token 套餐限时秒杀交易平台**的 Java 重构工�
 | 构建 | Maven 3.9.x + Maven Wrapper（仓库内置 `mvnw`） |
 | 持久化 | MyBatis-Plus 3.5.17（boot4 starter）+ MySQL 9.7 + Flyway 12.4 |
 | 认证 | Spring Security 7 + Nimbus JWT（HS256，本地验签） |
-| 缓存 / 消息 | Redis 8.10.x / Kafka 4.3.1（V1 关键链路不依赖，V1.5 才接入） |
+| 缓存 / 消息 | Redis 8.10.x（F7 活动公开详情缓存；不参与交易判定）/ Kafka 4.3.1（后续阶段接入） |
 | 前端 | React 19 + TypeScript 5.x + Vite + pnpm（`frontend/`） |
 
 各依赖的实际解析版本见 [docs/VERSION_LOCK.md](docs/VERSION_LOCK.md)。
@@ -451,6 +451,28 @@ pnpm build
 后端会在边界时刻给出不同答案。时间按 `Asia/Shanghai`（UTC+8）格式化，仅用于展示。订单页同样
 不做倒计时：支付截止时间是服务端固化的事实，浏览器再算一遍只会制造第二个「真相」。
 
+
+## 活动详情热读缓存（F7）
+
+仅 `GET /api/v1/activities/{id}` 使用 Redis Cache-Aside。公开活动快照包含活动配置和库存展示值；`runtimeStatus` 每次由服务端 `Clock` 计算。`availableStock` 允许短时陈旧，下单仍完全依赖 MySQL 条件库存更新与唯一键。
+
+- Redis 键前缀：`tokenx:activity:public:v1`；快照按活动 generation 存储，提交后递增 generation，避免并发旧查询把旧值写回可见缓存。
+- 正缓存 TTL 随机 `30–45s`；不存在、草稿、下架统一返回 `404 ACTIVITY_NOT_FOUND`，负缓存 TTL 随机 `5–10s`。
+- 活动创建/发布/下架、秒杀库存预占、超时库存归还只在对应 MySQL 事务提交后失效缓存。Redis 故障不影响数据库事务提交。
+- 总入口最多 128 个活动请求、另有最多 64 个有界等待名额，最长等待 10ms；过载返回 `429 ACTIVITY_READ_CAPACITY_EXCEEDED`。Redis 故障时最多 8 个请求并发回源 MySQL、最多 8 个等待名额且最长等待 20ms；回退名额耗尽返回 `503 ACTIVITY_READ_UNAVAILABLE`。
+- Redis 命令/连接超时均默认 500ms。所有参数启动时校验，环境变量如下：
+
+| 环境变量 | 默认值 | 用途 |
+|---|---:|---|
+| `TOKENX_ACTIVITY_CACHE_NAMESPACE` | `tokenx:activity:public:v1` | 专用缓存命名空间 |
+| `TOKENX_ACTIVITY_CACHE_POSITIVE_TTL_MIN` / `_MAX` | `30s` / `45s` | 正缓存 TTL 随机区间 |
+| `TOKENX_ACTIVITY_CACHE_NEGATIVE_TTL_MIN` / `_MAX` | `5s` / `10s` | 负缓存 TTL 随机区间 |
+| `TOKENX_ACTIVITY_CACHE_MAX_CONCURRENT` / `MAX_QUEUED` / `_INGRESS_WAIT` | `128` / `64` / `10ms` | 总入口并发、等待队列与等待时长上界 |
+| `TOKENX_ACTIVITY_CACHE_FALLBACK_CONCURRENCY` / `FALLBACK_QUEUE` / `_FALLBACK_WAIT` | `8` / `8` / `20ms` | Redis 故障时 MySQL 回源并发、队列与等待上界 |
+| `TOKENX_ACTIVITY_CACHE_REDIS_COMMAND_TIMEOUT` / `_CONNECT_TIMEOUT` | `500ms` / `500ms` | Redis 命令与连接超时（最大 5s） |
+
+F7 不缓存管理接口、下单校验或交易事实，不改变 API 成功响应结构，无数据库迁移。正式性能结果和 QPS 由 F10 使用固定负载口径测量。
+
 ## 数据库迁移
 
 - 迁移脚本位于 `src/main/resources/db/migration/`，命名 `V<版本>__<说明>.sql`。
@@ -473,7 +495,8 @@ pnpm build
 - 默认配置在 `src/main/resources/application.yml`，**不包含任何真实密码或密钥**。
 - 本地覆盖配置放在 `application-local.yml`（已忽略），或通过 `TOKENX_DB_USERNAME` /
   `TOKENX_DB_PASSWORD` / `TOKENX_JWT_SECRET` / `TOKENX_JWT_TTL` /
-  `TOKENX_ORDER_PAYMENT_TIMEOUT` 环境变量注入。
+  `TOKENX_ORDER_PAYMENT_TIMEOUT` 环境变量注入。F7 缓存和背压参数使用
+  `TOKENX_ACTIVITY_CACHE_*` 环境变量；默认值及具体名称见 `src/main/resources/application.yml`。
 - `tokenx.auth.jwt.secret` 少于 32 字符时应用启动失败：这是有意的，避免用弱密钥或空密钥上线。
 - `tokenx.order.payment-timeout`（默认 `15m`）必须为正且不超过 `24h`，否则应用启动失败：
   “永不过期”的订单比启动失败更糟。该值在创建订单时固化进 `expires_at`。

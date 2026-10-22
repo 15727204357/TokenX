@@ -32,7 +32,8 @@ spring:
     redis:
       host: 127.0.0.1
       port: 6379
-      timeout: 2s
+      connect-timeout: ${TOKENX_ACTIVITY_CACHE_REDIS_CONNECT_TIMEOUT:500ms}
+      timeout: ${TOKENX_ACTIVITY_CACHE_REDIS_COMMAND_TIMEOUT:500ms}
 
 mybatis-plus:
   configuration:
@@ -45,6 +46,21 @@ mybatis-plus:
       id-type: auto
 
 tokenx:
+  activity-cache:
+    namespace: ${TOKENX_ACTIVITY_CACHE_NAMESPACE:tokenx:activity:public:v1}
+    positive-ttl-min: ${TOKENX_ACTIVITY_CACHE_POSITIVE_TTL_MIN:30s}
+    positive-ttl-max: ${TOKENX_ACTIVITY_CACHE_POSITIVE_TTL_MAX:45s}
+    negative-ttl-min: ${TOKENX_ACTIVITY_CACHE_NEGATIVE_TTL_MIN:5s}
+    negative-ttl-max: ${TOKENX_ACTIVITY_CACHE_NEGATIVE_TTL_MAX:10s}
+    max-concurrent-requests: ${TOKENX_ACTIVITY_CACHE_MAX_CONCURRENT:128}
+    max-queued-requests: ${TOKENX_ACTIVITY_CACHE_MAX_QUEUED:64}
+    ingress-wait: ${TOKENX_ACTIVITY_CACHE_INGRESS_WAIT:10ms}
+    fallback-concurrency: ${TOKENX_ACTIVITY_CACHE_FALLBACK_CONCURRENCY:8}
+    fallback-queue-capacity: ${TOKENX_ACTIVITY_CACHE_FALLBACK_QUEUE:8}
+    fallback-wait: ${TOKENX_ACTIVITY_CACHE_FALLBACK_WAIT:20ms}
+    redis-command-timeout: ${TOKENX_ACTIVITY_CACHE_REDIS_COMMAND_TIMEOUT:500ms}
+    redis-connect-timeout: ${TOKENX_ACTIVITY_CACHE_REDIS_CONNECT_TIMEOUT:500ms}
+
   auth:
     jwt:
       # No default on purpose: supply TOKENX_JWT_SECRET, or put the value in the git-ignored

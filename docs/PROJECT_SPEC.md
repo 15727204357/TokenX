@@ -21,7 +21,8 @@
 
 ### 1.2 V1 稳定后再做（V1.5）
 
-- Redis 热点读取缓存与 Lua 抢购准入；Redis 是快路径，MySQL 是最终库存与资格权威。
+- F7 仅为 `GET /api/v1/activities/{id}` 建立 Redis Cache-Aside 公开快照缓存；`runtimeStatus` 每次由注入的 `Clock` 计算，库存字段只是展示快照。秒杀下单正确性仍只依赖 MySQL 条件更新和唯一键。缓存具有正/负缓存、TTL 抖动和提交后主动失效；Redis 故障只允许经有界并发闸门回退 MySQL。该读缓存与后续 Redis Lua 准入是两个不同用途。
+- 后续 Redis Lua 抢购准入仍以 Redis 为快路径、MySQL 为最终库存与资格权威。
 - Kafka 作为唯一异步下单队列；Transactional Outbox 只用于数据库事务后的下游事件。**不使用 Redis Stream 作为第二条订单队列。**
 - 简单限流、指标采集、压测和同步/异步方案对比。
 - Redis Stream 只作为黑马点评参考实现的研究对象，不进入 TokenX 订单链路。
@@ -165,7 +166,7 @@ V1 明确不建 `purchase_qualification` 和模拟 `payment_record`：前者由�
 | PATCH | `/admin/products/{id}/status` | 套餐上架/下架（管理员；重复同一状态幂等成功） | F2 |
 | POST | `/admin/activities` | 新增秒杀活动（管理员；固定 `DRAFT`，同事务初始化库存） | F3 |
 | PATCH | `/admin/activities/{id}/status` | 活动发布/下架（管理员；重复同一状态幂等成功） | F3 |
-| GET | `/activities/{id}` | 活动详情、运行状态和库存展示（仅 `PUBLISHED`；不存在/草稿/已下架同为 `404 ACTIVITY_NOT_FOUND`） | F3 |
+| GET | `/activities/{id}` | 活动详情、运行状态和库存展示（仅 `PUBLISHED`；不存在/草稿/已下架同为 `404 ACTIVITY_NOT_FOUND`；容量过载 `429 ACTIVITY_READ_CAPACITY_EXCEEDED`，Redis 故障且安全回源名额耗尽 `503 ACTIVITY_READ_UNAVAILABLE`） | F3/F7 |
 | POST | `/activities/{id}/orders` | 秒杀下单。**无请求体**，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同一键重放 `200`（不再次扣库存）。失败：`400 VALIDATION_FAILED`、`404 ACTIVITY_NOT_FOUND`、`409 ACTIVITY_NOT_ACTIVE`/`ACTIVITY_SOLD_OUT`/`ALREADY_PURCHASED`/`IDEMPOTENCY_KEY_REUSED` | F4 |
 | GET | `/orders/{orderNo}` | 按不可枚举对外单号查询**自己的**订单；不存在与他人订单同为 `404 ORDER_NOT_FOUND`，格式非法 `400 VALIDATION_FAILED` | F4 |
 | POST | `/orders` | 普通购买。请求体只有 `{"packageId":<正整数>}`，Header 必须带规范 UUID 的 `Idempotency-Key`；本次创建 `201`，同键同套餐重放 `200`。失败：`400 VALIDATION_FAILED`、`401 UNAUTHORIZED`、`404 PRODUCT_NOT_FOUND`、`409 PACKAGE_NOT_AVAILABLE`/`IDEMPOTENCY_KEY_REUSED` | F4.5 |

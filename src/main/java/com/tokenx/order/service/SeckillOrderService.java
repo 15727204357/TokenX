@@ -123,7 +123,11 @@ public class SeckillOrderService {
       try {
         CreatedOrder created =
             writeTemplate.execute(status -> createInTransaction(userId, activityId, requestId));
-        return Objects.requireNonNull(created, "order creation produced no result");
+        CreatedOrder result = Objects.requireNonNull(created, "order creation produced no result");
+        if (result.created()) {
+          activityService.invalidatePublicCacheAfterCommit(activityId);
+        }
+        return result;
       } catch (DuplicateKeyException ex) {
         // The transaction is gone by now: rolled back, connection returned. Whatever we conclude
         // next is read from committed data.
